@@ -3,6 +3,7 @@
 
 """The co-host runtime's device-free core: config, device ownership, barriers, RPC, lock window."""
 
+import importlib
 import json
 import os
 import sys
@@ -663,3 +664,35 @@ def test_the_kv_cap_works_with_a_plugin_whose_block_count_takes_only_the_config(
     vcfg = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=64))
     assert host.device.run("a", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 100
     assert host.device.run("b", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 1000
+
+
+@pytest.mark.parametrize("worker_blocks", [512, None])
+def test_the_engine_sees_the_kv_block_count_an_older_plugin_sets_on_its_worker(monkeypatch, worker_blocks):
+    """Older TT plugins return a dummy byte count from determine_available_memory and set the real KV block count on
+    the worker's cache_config; the engine in the member's process must get it, as it would with the worker in-process."""
+    worker = types.SimpleNamespace(cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+
+    class Client:
+        def call(self, op, method=None, args=(), kwargs=None):
+            if method == "determine_available_memory":
+                worker.cache_config.num_gpu_blocks_override = worker_blocks
+                return 1 << 64
+            return method(types.SimpleNamespace(worker=worker))  # a callable runs on the host's worker wrapper
+
+    class UniProcExecutor:
+        def determine_available_memory(self):
+            return self.collective_rpc("determine_available_memory")
+    for name, mod in {"cloudpickle": types.SimpleNamespace(dumps=lambda fn: fn),
+                      "vllm": types.ModuleType("vllm"),
+                      "vllm.platforms": types.SimpleNamespace(current_platform=types.SimpleNamespace()),
+                      "vllm.v1": types.ModuleType("vllm.v1"), "vllm.v1.executor": types.ModuleType("vllm.v1.executor"),
+                      "vllm.v1.executor.uniproc_executor": types.SimpleNamespace(UniProcExecutor=UniProcExecutor)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "tt_cohost.vllm_remote", raising=False)
+    vllm_remote = importlib.import_module("tt_cohost.vllm_remote")  # not the package attribute an earlier test left
+    ex = vllm_remote.RemoteExecutor.__new__(vllm_remote.RemoteExecutor)
+    ex._client = Client()
+    ex.vllm_config = types.SimpleNamespace(cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+    assert ex.determine_available_memory() == [1 << 64]
+    assert ex.vllm_config.cache_config.num_gpu_blocks_override == worker_blocks
+    sys.modules.pop("tt_cohost.vllm_remote", None)
