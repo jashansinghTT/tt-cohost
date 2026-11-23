@@ -3,7 +3,7 @@
 
 """A vLLM executor whose worker runs in the co-host device host.
 
-Launch a member with ``--distributed-executor-backend tt_kernel.cohost.vllm_remote.RemoteExecutor``
+Launch a member with ``--distributed-executor-backend tt_cohost.vllm_remote.RemoteExecutor``
 and ``TT_COHOST_SOCKET`` set. The API server, engine core and scheduler stay in this
 process. Each worker call goes over the socket to a real TTWorker in the device host, which
 is the only process that opens the chips.

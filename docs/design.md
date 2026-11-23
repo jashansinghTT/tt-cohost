@@ -2,14 +2,14 @@
 
 A Tenstorrent chip can be opened by one process at a time. UMD takes a per-chip lock when the
 device starts and holds it until the process exits. So two models that must share chips have
-to share a process. `tt_kernel.cohost` is that process.
+to share a process. `tt_cohost` is that process.
 
 - **The device host** opens one mesh over the group's chips and owns every device call. Its
   device loop runs on the process's main thread: tt-metal closes the chips on the main thread
   at exit, and UMD's per-chip lock can only be released by the thread that took it.
 - **vLLM members.** Each one keeps its own stock vLLM OpenAI server on its own port. Its
   worker runs inside the device host, behind
-  `--distributed-executor-backend tt_kernel.cohost.vllm_remote.RemoteExecutor`. The
+  `--distributed-executor-backend tt_cohost.vllm_remote.RemoteExecutor`. The
   scheduler, the tool and reasoning parsers, and the whole API stay vLLM's own. The frontend
   and the host talk in pickle frames over a Unix socket (vLLM configs and worker calls, as
   vLLM's own multiprocess executor sends them). The socket directory is private to the host's
@@ -53,7 +53,7 @@ environment variable:
 | `preload` | `module:function` called before this member is built (an image-side fit patch) |
 | `app` | app: `module:factory` returning an `AppMember` |
 
-`python -m tt_kernel.cohost.launch` boots the group, prints `cohost: all members ready`, and
+`python -m tt_cohost.launch` boots the group, prints `cohost: all members ready`, and
 exits non-zero if any member fails. One failure stops the whole group.
 
 A member's `env` is set around its own load and warmup calls and put back afterwards. Only

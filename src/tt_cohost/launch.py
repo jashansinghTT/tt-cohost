@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
 
-"""Co-host container entrypoint: ``python -m tt_kernel.cohost.launch --config <json>``.
+"""Co-host container entrypoint: ``python -m tt_cohost.launch --config <json>``.
 
 It starts the device host in this process, then one stock vLLM OpenAI server per vLLM
 member, each on its own port and wired to the host by ``RemoteExecutor``. It prints
@@ -34,11 +34,11 @@ def frontend_argv(m: Member) -> List[str]:
     """``vllm serve`` for one member, with its worker in the device host."""
     return [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", m.model, *m.args,
             "--host", "0.0.0.0", "--port", str(m.port),
-            "--distributed-executor-backend", "tt_kernel.cohost.vllm_remote.RemoteExecutor"]
+            "--distributed-executor-backend", "tt_cohost.vllm_remote.RemoteExecutor"]
 
 
 def frontend_env(cfg: CohostConfig, m: Member) -> Dict[str, str]:
-    pkg_root = str(Path(__file__).resolve().parents[2])
+    pkg_root = str(Path(__file__).resolve().parents[1])   # the directory holding tt_cohost
     env = {**os.environ, **m.env, "TT_COHOST_SOCKET": cfg.socket_path(m.name),
            "TT_COHOST_MEMBER": m.name}
     env["PYTHONPATH"] = os.pathsep.join(p for p in (pkg_root, env.get("PYTHONPATH", "")) if p)

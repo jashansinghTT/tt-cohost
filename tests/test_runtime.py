@@ -12,10 +12,10 @@ import types
 
 import pytest
 
-from tt_kernel.cohost import config as cfgmod
-from tt_kernel.cohost import host as hostmod
-from tt_kernel.cohost import launch, rpc
-from tt_kernel.cohost.device import Device
+from tt_cohost import config as cfgmod
+from tt_cohost import host as hostmod
+from tt_cohost import launch, rpc
+from tt_cohost.device import Device
 
 
 def _write(tmp_path, **over):
@@ -68,7 +68,7 @@ def test_a_device_without_its_own_thread_runs_jobs_on_the_thread_that_loops_it()
 def test_launch_runs_the_device_on_the_main_thread_and_closes_the_mesh_there(tmp_path, monkeypatch):
     """tt-metal tears the chips down on the main thread at exit; UMD's per-chip lock must be
     released by the thread that took it, so the mesh is opened and closed on the main thread."""
-    from tt_kernel.cohost import apps
+    from tt_cohost import apps
 
     closed_on = []
 
@@ -314,9 +314,18 @@ def test_each_vllm_member_is_a_stock_server_wired_to_the_host(tmp_path):
     assert argv[1:4] == ["-m", "vllm.entrypoints.openai.api_server", "--model"]
     assert argv[argv.index("--port") + 1] == "21001"
     assert argv[argv.index("--distributed-executor-backend") + 1] == \
-        "tt_kernel.cohost.vllm_remote.RemoteExecutor"
+        "tt_cohost.vllm_remote.RemoteExecutor"
     env = launch.frontend_env(cfg, cfg.members[1])
     assert env["TT_COHOST_SOCKET"] == cfg.socket_path("b") and env["TT_COHOST_MEMBER"] == "b"
+
+
+def test_a_frontend_can_import_the_package_it_was_launched_from(tmp_path):
+    """The executor qualname must resolve in the frontend, also from a checkout that is not installed."""
+    from pathlib import Path
+
+    cfg = cfgmod.load(_write(tmp_path))
+    first = launch.frontend_env(cfg, cfg.members[0])["PYTHONPATH"].split(os.pathsep)[0]
+    assert (Path(first) / "tt_cohost" / "vllm_remote.py").is_file()
 
 
 def test_the_shared_mesh_is_opened_once_with_the_real_opener(tmp_path, monkeypatch):
@@ -355,7 +364,7 @@ def test_a_member_kv_cap_limits_only_that_members_pool(tmp_path, monkeypatch):
 def test_app_members_boot_load_all_warm_all_release_all_warm_all_then_serve(tmp_path, monkeypatch):
     """The second warm round compiles and allocates nothing new, so no member's long-lived buffer
     can sit in another member's trace scratch."""
-    from tt_kernel.cohost import apps
+    from tt_cohost import apps
 
     events = []
 
@@ -390,7 +399,7 @@ def test_app_members_boot_load_all_warm_all_release_all_warm_all_then_serve(tmp_
 def test_an_app_member_whose_server_thread_ends_takes_the_group_down(tmp_path, monkeypatch):
     """Like an exited vLLM frontend: a uvicorn thread that ends (port taken, a crash after boot)
     would otherwise leave the group never ready, or reporting a dead port as ready."""
-    from tt_kernel.cohost import apps
+    from tt_cohost import apps
 
     class FakeHost:
         def __init__(self, cfg):
@@ -469,7 +478,7 @@ def test_a_mixed_group_lists_vllm_members_before_app_members(tmp_path):
 def test_mixed_group_apps_load_before_vllm_weights_and_capture_after_vllm(tmp_path, monkeypatch):
     """App weights are in DRAM before the vLLM member sizes its KV pool; both pass the same barriers; the
     vLLM member captures first, then the apps (config order), then the cache baseline is taken."""
-    from tt_kernel.cohost import apps
+    from tt_cohost import apps
 
     events = []
     lock = threading.Lock()
@@ -533,7 +542,7 @@ def test_mixed_group_apps_load_before_vllm_weights_and_capture_after_vllm(tmp_pa
 
 
 def test_a_failed_app_load_releases_the_vllm_member_with_the_failure(tmp_path, monkeypatch):
-    from tt_kernel.cohost import apps
+    from tt_cohost import apps
 
     class Broken(apps.AppMember):
         def __init__(self, host, member):
