@@ -170,13 +170,19 @@ With `status_port` set, `GET http://<host>:<status_port>/` returns:
 ```json
 {
   "mesh_device": "P150x4",
-  "members": {"gptoss": {"kind": "vllm", "port": 21000, "ready": true}, "...": {}},
-  "device_owner": "gptoss",
-  "compiles_after_capture": {"llama8b": 3},
-  "dram_gib_per_chip": {"members": {"gptoss": {"load_model": 7.1, "initialize_from_config": 3.29}}, "total": 13.2},
-  "l1_kib_per_core_after_phase": {"gptoss": 370.0}
+  "members": {"gptoss": {"kind": "vllm", "port": 20000, "ready": true},
+              "llama8b": {"kind": "vllm", "port": 20001, "ready": true}},
+  "device_owner": null,
+  "compiles_after_capture": {"gptoss": 3, "llama8b": 21},
+  "dram_gib_per_chip": {"members": {
+      "gptoss": {"load_model": 7.101, "initialize_from_config": 3.287, "compile": 0.081, "capture": 0.02},
+      "llama8b": {"load_model": 1.848, "initialize_from_config": 2.125, "compile": 0.081, "capture": 0.008}},
+    "total": 14.47},
+  "l1_kib_per_core_after_phase": {"gptoss": 380.8, "llama8b": 380.8}
 }
 ```
+
+(GPT-OSS-20B + Llama-3.1-8B on a QuietBox 2, after one request each.)
 
 `dram_gib_per_chip` is what each member's phases added to per-chip DRAM; `l1_kib_per_core_after_phase` is
 the L1 held by live buffers after that member's last measured phase, and `l1_kib_per_core` the same after each of
