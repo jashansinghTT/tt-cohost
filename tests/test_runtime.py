@@ -307,6 +307,34 @@ def test_a_member_without_warmup_still_takes_its_capture_turn(tmp_path, fake_vll
     assert host._capture_turn == 1, "member b would wait for a's capture turn forever"
 
 
+@pytest.mark.parametrize("newer", [True, False])
+def test_the_phased_warmup_runs_on_older_and_newer_vllm_and_plugin_builds(tmp_path, fake_vllm, monkeypatch, newer):
+    """Older builds (tt-inference-server's 0.17.0 image): vLLM has no CompilationTimes and the runner no
+    tt_max_batch_size; their own warmup_model decodes max_num_seqs * data_parallel_size."""
+    worker_base = types.SimpleNamespace(CompilationTimes=lambda **k: k) if newer else types.ModuleType("worker_base")
+    platform = types.SimpleNamespace(check_and_update_config=lambda cfg: None, sample_on_device_mode="decode_only")
+    for name, mod in {"vllm.v1.worker": types.ModuleType("vllm.v1.worker"), "vllm.v1.worker.worker_base": worker_base,
+                      "vllm_tt_plugin": types.ModuleType("vllm_tt_plugin"),
+                      "vllm_tt_plugin.platform": types.SimpleNamespace(TTPlatform=platform)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    warmups = []
+    model = types.SimpleNamespace(
+        warmup_model_prefill=lambda enable_trace, **k: warmups.append(("prefill", enable_trace)),
+        warmup_model_decode=lambda enable_trace, **k: warmups.append(("decode", enable_trace, k["max_batch_size"])))
+    runner = types.SimpleNamespace(model=model, kv_caches=[], max_num_blocks_per_req=128, trace_mode="decode_only",
+                                   scheduler_config=types.SimpleNamespace(max_num_seqs=32),
+                                   parallel_config=types.SimpleNamespace(data_parallel_size=1))
+    if newer:
+        runner.tt_max_batch_size = 64
+    host, vm = _member(tmp_path, {})
+    vm.wrapper = types.SimpleNamespace(worker=types.SimpleNamespace(enable_model_warmup=True, model_runner=runner))
+    threading.Thread(target=lambda: (host.loaded.wait("b"), host.compiled.wait("b")), daemon=True).start()
+    result = vm._phased_warmup()
+    batch = 64 if newer else 32
+    assert warmups == [("prefill", False), ("decode", False, batch), ("decode", True, batch)]
+    assert (result is not None) == newer
+
+
 # ------------------------------------------------------------------------------ launch
 
 def test_each_vllm_member_is_a_stock_server_wired_to_the_host(tmp_path):
