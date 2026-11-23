@@ -58,6 +58,19 @@ Each vLLM member's server is a stock `vllm.entrypoints.openai.api_server` starte
 stay vLLM's own, and only its worker runs in the device host (over a Unix socket private to the host's
 user).
 
+### vllm-tt-plugin versions
+
+The host uses the plugin's co-host hooks when the installed plugin has them, and says which path ran in its log
+and in the status (`plugin_hooks`):
+
+| hook | with it | without it (older plugins) |
+|---|---|---|
+| mesh provider (`vllm_tt_plugin.mesh_provider`) | the host registers a provider that hands every worker the group's mesh | the host patches the plugin's `open_mesh_device` / `close_mesh_device` |
+| KV block override (vLLM's `--num-gpu-blocks-override`) | a member's `kv_tokens` is passed to its vLLM server | the host patches the plugin's `get_num_available_blocks_tt` |
+| split warmup (`TTWorker.compile_model` / `capture_model`) | the host calls the worker's own two steps | the host calls the runner's `warmup_model_prefill` / `warmup_model_decode` itself |
+
+The KV override goes with the mesh provider: a plugin without the provider gets the patched block count.
+
 ## Group config (version 1)
 
 ```json
@@ -91,7 +104,7 @@ user).
 | `port` | the member's HTTP port (unique in the group) |
 | `model`, `args` | vllm: what `vllm serve` gets (`--model <model> <args...>`) |
 | `env` | set around this member's load-time calls (and in its vLLM frontend), restored afterwards |
-| `kv_tokens` | vllm: cap on this member's KV pool in tokens (all users), so the members' DRAM adds up |
+| `kv_tokens` | vllm: this member's KV pool in tokens (all users), so the members' DRAM adds up. With a plugin that has the co-host hooks it is passed as vLLM's `--num-gpu-blocks-override` (rounded up to whole blocks) and sets the pool; with an older plugin it caps the plugin's own count |
 | `preload` | `module:function` called in the member's env before it is built (a fit patch, e.g. a smaller-L1 program choice) |
 | `app` | app: `module:factory` returning an `AppMember` |
 
@@ -101,7 +114,8 @@ unknown, an app member has no `module:factory`, or a mixed group lists an app me
 ## Member kinds
 
 - **`vllm`**: any model vllm-tt-plugin serves. The host runs the plugin's normal `TTWorker` for it; the
-  worker gets the group's shared mesh instead of opening its own and never closes it.
+  worker gets the group's shared mesh instead of opening its own and never closes it. The mesh opens with the
+  first worker's own arguments, with every key of the group's `tt_config` on top.
 - **`app`**: a model with its own HTTP API, wrapped in an adapter that implements the app-member
   contract below. Its ASGI app is served from the host process on the member's port.
 

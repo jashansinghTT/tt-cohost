@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from .config import CohostConfig, Member, load, loads
 
@@ -30,9 +30,27 @@ READY_LINE = "cohost: all members ready"
 log = logging.getLogger("tt_cohost")
 
 
-def frontend_argv(m: Member) -> List[str]:
-    """``vllm serve`` for one member, with its worker in the device host."""
-    return [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", m.model, *m.args,
+#: vLLM's KV block size on TT when a member does not pass --block-size.
+TT_BLOCK_SIZE = 64
+
+
+def _block_size(args: List[str]) -> int:
+    for i, a in enumerate(args):
+        if a == "--block-size" and i + 1 < len(args):
+            return int(args[i + 1])
+        if a.startswith("--block-size="):
+            return int(a.split("=", 1)[1])
+    return TT_BLOCK_SIZE
+
+
+def frontend_argv(m: Member, hooks: Optional[Dict[str, bool]] = None) -> List[str]:
+    """``vllm serve`` for one member, with its worker in the device host. With the plugin's hooks a member's
+    ``kv_tokens`` becomes vLLM's own ``--num-gpu-blocks-override`` (older plugins: the host caps the count)."""
+    kv = []
+    if m.kv_tokens and (hooks or {}).get("mesh_provider") and \
+            not any(a.split("=", 1)[0] == "--num-gpu-blocks-override" for a in m.args):
+        kv = ["--num-gpu-blocks-override", str(-(-m.kv_tokens // _block_size(m.args)))]
+    return [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", m.model, *m.args, *kv,
             "--host", "0.0.0.0", "--port", str(m.port),
             "--distributed-executor-backend", "tt_cohost.vllm_remote.RemoteExecutor"]
 
@@ -104,7 +122,7 @@ def _supervise(cfg, host, stopping: threading.Event) -> int:
     for m in cfg.members:
         if m.kind != "vllm":
             continue
-        p = subprocess.Popen(frontend_argv(m), env=frontend_env(cfg, m), stdout=subprocess.PIPE,
+        p = subprocess.Popen(frontend_argv(m, getattr(host, "hooks", None)), env=frontend_env(cfg, m), stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, bufsize=1)
         procs[m.name] = p
         threading.Thread(target=_pump, args=(m.name, p.stdout), daemon=True).start()
