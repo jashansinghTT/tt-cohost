@@ -165,8 +165,72 @@ With `status_port` set, `GET http://<host>:<status_port>/` returns:
 ```
 
 `dram_gib_per_chip` is what each member's phases added to per-chip DRAM; `l1_kib_per_core_after_phase` is
-the L1 held by live buffers after that member's last measured phase. `TT_COHOST_L1_REPORT=1` also logs
+the L1 held by live buffers after that member's last measured phase, and `l1_kib_per_core` the same after each of
+its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`, `timeout`, `aborted`) and error,
+and `failure` the first member that failed on its own. `TT_COHOST_L1_REPORT=1` also logs
 every live L1 buffer after each phase.
+
+## Will they fit? The fit check
+
+```bash
+python -m tt_cohost.fit --config group.json --json fit.json
+```
+
+The fit check boots the group exactly as the launcher does (in a child process that owns the chips), sends each
+vLLM member one short greedy request, stops the group and writes a report. The verdict is `shared` when every member
+booted and answered, else `separate` with the member, the phase and the reason, e.g.
+
+```text
+fit: separate: llama8b failed in compile: L1 clash (its programs need L1 another member holds): Statically
+allocated dataflow buffers in program 2950 clash with L1 buffers on core range [0-0 - 3-0]. ...
+```
+
+```json
+{
+  "fit_report_version": 1,
+  "verdict": "separate",
+  "fits": false,
+  "reason": "llama8b failed in compile: L1 clash (...): Statically allocated dataflow buffers ...",
+  "failure": {"member": "llama8b", "phase": "compile", "kind": "l1_clash", "error": "Statically allocated ..."},
+  "mesh_device": "P150x4",
+  "outcome": "exited",
+  "boot_seconds": 341.2,
+  "dram_gib_per_chip_total": 14.36,
+  "members": {
+    "gptoss": {"kind": "vllm", "port": 20000, "status": "aborted", "phase": "compile", "error_kind": "error",
+               "dram_gib_per_chip": {"load_model": 7.1, "initialize_from_config": 3.29},
+               "l1_kib_per_core": {"load_model": 370.5, "initialize_from_config": 370.5},
+               "compiles_after_capture": 0, "error": "...", "error_full": "..."},
+    "llama8b": {"kind": "vllm", "port": 20001, "status": "failed", "phase": "compile", "error_kind": "l1_clash", "...": "..."}
+  },
+  "warnings": []
+}
+```
+
+- Member `status`: `ok`, `failed` (this member is the cause), `timeout` (it never finished its phase), `aborted`
+  (it stopped because another member failed).
+- Phases: `init`, `open`, `load`, `kv_cache`, `compile`, `capture`, `start-server`, `ready`, then `serve` for the
+  probe request.
+- Failure kinds: `l1_clash`, `dram`, `opens_device`, `timeout`, `server_exited`, `probe`, `late_compile` (only with
+  `--strict`), `error`.
+- `l1_kib_per_core` is the L1 held on each core after each of the member's phases, counting every member's buffers.
+- Programs compiled after capture are listed under `warnings`; `--strict` makes them fail the member.
+- Exit code 0 with a verdict either way; 2 only when the check itself could not run (an invalid config, a launcher
+  that died before the group existed). `--timeout` (default 5400 s) bounds the boot; `--workdir` keeps the group's
+  config, log and status.
+
+## Does a model behave next to others? The conformance test
+
+```bash
+python -m tt_cohost.conformance --config group.json --member llama8b --out conformance/
+# llama8b next to gptoss: sequential 16/16 identical, interleaved 16/16 identical: PASS
+```
+
+It serves the member alone (a one-member group on the same mesh, or `--baseline` greedy rows from its own server),
+then with the whole group: the prompts once one at a time and once while every vLLM neighbour answers its own stream
+of requests, so the members' steps interleave on the device. Each prompt's output is compared exactly with the alone
+run. Pass = all identical in both modes. `--prompts` takes a JSON list or one prompt per line (16 built in). Pick a
+neighbour that holds a typical amount of L1. Exit 0 on pass, 1 on a difference, 2 when the test could not run.
 
 ## Environment variables
 
@@ -177,6 +241,7 @@ every live L1 buffer after each phase.
 | `TT_COHOST_TIMING_S` | `30` | log per-call wall time every N seconds of activity (`0` = off) |
 | `TT_COHOST_L1_REPORT` | | set to log every live L1 buffer after each phase |
 | `TT_COHOST_CONNECT_TIMEOUT_S` | `600` | connect timeout of a vLLM frontend's socket to the host |
+| `TT_COHOST_STATUS_FILE` | | also write the status JSON (with the boot record) to this file on every change |
 
 ## Limits
 
