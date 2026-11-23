@@ -10,7 +10,8 @@ member one short greedy request, stops the group, and reports per member and pha
 programs compiled after trace capture, and, if a member failed, the member, the phase and the error (an L1 clash,
 out of DRAM, opening its own device, a timeout). The verdict is ``shared`` when every member booted and answered,
 else ``separate`` with the reason. It exits 0 with a verdict either way, and 2 only when the check itself could not
-run (an invalid config, a launcher that died before the group existed).
+run (an invalid config, a launcher that died before the group existed), and 3 when a device fault (a chip that needs
+a reset) stopped the boot: that report says nothing about whether the members fit.
 """
 
 from __future__ import annotations
@@ -34,6 +35,8 @@ PROBE_PROMPT = "The capital of France is"
 
 #: (kind, pattern) in priority order: the first match in a member's error names the kind and the line shown.
 _KINDS: List[Tuple[str, str]] = [
+    ("device", r"[^\n]*(?:Try resetting the board|Timed out while waiting for active ethernet core|"
+               r"failed to initialize FW|Fabric Router Sync: Timeout|Ethernet handshake likely failed)[^\n]*"),
     ("l1_clash", r"Statically allocated (?:dataflow|circular) buffers[^\n]*clash with L1 buffers[^\n]*"),
     ("l1_clash", r"Statically allocated (?:dataflow|circular) buffers[^\n]*beyond max L1 size[^\n]*"),
     ("dram", r"[^\n]*(?:Out of Memory|Not enough space to allocate)[^\n]*"),
@@ -51,7 +54,9 @@ KIND_TEXT = {
     "late_compile": "programs compiled after trace capture",
     "probe": "it did not answer a request",
     "error": "error",
+    "device": "device fault (the chips need a reset; this is not a fit result)",
 }
+EXIT_DEVICE_FAULT = 3
 
 
 class ToolError(RuntimeError):
@@ -159,6 +164,7 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
         "dram_gib_per_chip_total": (status.get("dram_gib_per_chip") or {}).get("total"),
         "members": members,
         "warnings": warnings,
+        "device_fault": bool(failure and failure["kind"] == "device"),
     }
 
 
@@ -228,13 +234,15 @@ def main(argv=None) -> int:
     else:
         print(text)
     print(f"fit: {report['verdict']}: {report['reason']}", file=sys.stderr)
+    if report["device_fault"]:
+        print("fit: a device fault stopped the boot; reset the chips and run the check again", file=sys.stderr)
     for n, e in report["members"].items():
         print(f"  {n}: {e['status']} ({e['phase']}); DRAM GiB/chip {e['dram_gib_per_chip']}; "
               f"L1 KiB/core {e['l1_kib_per_core']}; compiles after capture {e['compiles_after_capture']}",
               file=sys.stderr)
     for w in report["warnings"]:
         print(f"  warning: {w}", file=sys.stderr)
-    return 0
+    return EXIT_DEVICE_FAULT if report["device_fault"] else 0
 
 
 if __name__ == "__main__":

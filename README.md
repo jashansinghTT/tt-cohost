@@ -232,11 +232,11 @@ allocated dataflow buffers in program 2950 clash with L1 buffers on core range [
 - Phases: `init`, `open`, `load`, `kv_cache`, `compile`, `capture`, `start-server`, `ready`, then `serve` for the
   probe request.
 - Failure kinds: `l1_clash`, `dram`, `opens_device`, `timeout`, `server_exited`, `probe`, `late_compile` (only with
-  `--strict`), `error`.
+  `--strict`), `device` (a chip that needs a reset: not a fit result; `device_fault` is true), `error`.
 - `l1_kib_per_core` is the L1 held on each core after each of the member's phases, counting every member's buffers.
 - Programs compiled after capture are listed under `warnings`; `--strict` makes them fail the member.
-- Exit code 0 with a verdict either way; 2 only when the check itself could not run (an invalid config, a launcher
-  that died before the group existed). `--timeout` (default 5400 s) bounds the boot; `--workdir` keeps the group's
+- Exit code 0 with a verdict either way; 2 when the check itself could not run (an invalid config, a launcher that
+  died before the group existed); 3 when a device fault stopped the boot (reset the chips and run it again). `--timeout` (default 5400 s) bounds the boot; `--workdir` keeps the group's
   config, log and status.
 
 ## Does a model behave next to others? The conformance test
