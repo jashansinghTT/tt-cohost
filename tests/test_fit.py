@@ -85,9 +85,25 @@ def test_the_cli_exits_0_with_a_separate_verdict_and_2_on_a_bad_config(tmp_path,
      "must use the mesh it is given", "opens_device", "llama8b called ttnn.open_mesh_device"),
     ("did not finish load within 7200 s (barrier loaded: ['b'] never arrived)", "timeout", "did not finish load"),
     ("RuntimeError: its server exited (code 1)", "server_exited", "its server exited (code 1)"),
+    ("RuntimeError: TT_THROW @ /x/llrt.cpp:594: tt::exception\ninfo:\nDevice 2: Timed out while waiting for active "
+     "ethernet core 29-25 to become active again. Try resetting the board.", "device", "Device 2: Timed out"),
     ("RuntimeError: TT_THROW @ /x/y.cpp:1: tt::exception\ninfo:\nsomething else broke", "error",
      "something else broke"),
 ])
 def test_errors_are_classified_by_the_line_that_says_what_happened(error, kind, shown):
     got_kind, line = fit.classify(error)
     assert got_kind == kind and shown in line
+
+
+def test_a_device_fault_is_not_a_fit_result_and_exits_3(tmp_path, monkeypatch, capsys):
+    err = ("RuntimeError: TT_THROW @ /x/llrt.cpp:594: tt::exception\ninfo:\nDevice 2: Timed out while waiting for "
+           "active ethernet core 29-25 to become active again. Try resetting the board.")
+    report = fit.build_report(
+        {"mesh_device": "P150x4", "members": [{"name": "a", "kind": "vllm", "port": 1}]}, "exited",
+        {"boot": {"a": {"phase": "open", "status": "failed", "error": err}},
+         "failure": {"member": "a", "phase": "open", "error": err}})
+    assert report["device_fault"] and report["failure"]["kind"] == "device"
+    assert "not a fit result" in report["reason"]
+    monkeypatch.setattr(fit, "run_fit", lambda *a, **k: report)
+    assert fit.main(["--config", "unused", "--json", str(tmp_path / "r.json")]) == 3
+    assert "reset the chips" in capsys.readouterr().err
