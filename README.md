@@ -187,7 +187,10 @@ With `status_port` set, `GET http://<host>:<status_port>/` returns:
 `dram_gib_per_chip` is what each member's phases added to per-chip DRAM; `l1_kib_per_core_after_phase` is
 the L1 held by live buffers after that member's last measured phase, and `l1_kib_per_core` the same after each of
 its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`, `timeout`, `aborted`) and error,
-and `failure` the first member that failed on its own. `TT_COHOST_L1_REPORT=1` also logs
+and `failure` the first member that failed on its own. With a ttnn that accounts memory per owner (`ttnn.memory_owner`,
+`ttnn.get_memory_usage_by_owner`), every member's device work runs as that member: `l1_kib_per_core_owned` is the L1
+each member's own buffers hold after each of its phases, `memory_by_owner` the latest L1 and DRAM per owner, and a fit
+check that fails on an L1 clash names who holds the L1. `TT_COHOST_L1_REPORT=1` also logs
 every live L1 buffer after each phase.
 
 ## Will they fit? The fit check

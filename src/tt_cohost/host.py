@@ -165,6 +165,10 @@ class Host:
         self.status_file = os.environ.get("TT_COHOST_STATUS_FILE") or None
         self._status_lock = threading.Lock()
         self._device_openers: Dict[str, Callable] = {}
+        #: With a ttnn that accounts memory per owner: the L1 (KiB/core) each member's own buffers hold after each of
+        #: its phases, and the latest per-owner snapshot of L1 and DRAM.
+        self.l1_owned: Dict[str, Dict[str, float]] = {}
+        self.owned_memory: Optional[Dict[str, Dict[str, float]]] = None
         #: Mixed groups: set once every app member has loaded. A vLLM member's ``load_model`` waits for it, so
         #: the apps' weights are in DRAM before any vLLM member sizes and allocates its KV pool.
         self.apps_loaded = threading.Event()
@@ -192,6 +196,7 @@ class Host:
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device,
                          self.mesh.get_num_devices())
                 self.guard_device_opens()
+                self.track_owners()
                 self.mesh_ready.set()
             return self.mesh
         return self.device.run("host", _open)
@@ -238,6 +243,7 @@ class Host:
                 self._close_mesh = close
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device, self.mesh.get_num_devices())
                 self.guard_device_opens()
+                self.track_owners()
                 self.mesh_ready.set()
             return self.mesh
         return self.device.run("host", _open)
@@ -288,6 +294,34 @@ class Host:
                                          "mesh is open; a co-host member must use the mesh it is given")
             self._device_openers[attr] = orig
             setattr(ttnn, attr, refuse)
+
+    def track_owners(self) -> None:
+        """With a ttnn that accounts memory per owner, every member's device work runs as that member, so the
+        status can say which member holds the L1 the others need."""
+        try:
+            import ttnn
+        except ImportError:
+            return
+        if hasattr(ttnn, "memory_owner") and hasattr(ttnn, "get_memory_usage_by_owner"):
+            self.device.scope = ttnn.memory_owner
+            log.info("cohost: ttnn accounts memory per owner; each member's buffers are attributed to it")
+
+    def memory_by_owner(self) -> Optional[Dict[str, Dict[str, float]]]:
+        """Per owner ("" = none): the L1 KiB/core and DRAM GiB/chip its live buffers hold. Device thread only."""
+        try:
+            import ttnn
+        except ImportError:
+            return None
+        if self.mesh is None or not hasattr(ttnn, "get_memory_usage_by_owner"):
+            return None
+        out: Dict[str, Dict[str, float]] = {}
+        for e in ttnn.get_memory_usage_by_owner(self.mesh):
+            kind = str(e.buffer_type).split(".")[-1]
+            if kind == "L1":
+                out.setdefault(e.owner, {})["l1_kib_per_core"] = round(e.bytes_per_bank / 1024, 1)
+            elif kind == "DRAM":    # a mesh buffer has the same size on every chip
+                out.setdefault(e.owner, {})["dram_gib_per_chip"] = round(e.total_bytes / 2**30, 3)
+        return out
 
     def _unguard_device_opens(self) -> None:
         if self._device_openers:
@@ -375,6 +409,10 @@ class Host:
             self.l1[who] = l1
             if l1 is not None:
                 self.l1_phases.setdefault(who, {})[phase] = l1
+            owned = self.memory_by_owner()
+            if owned is not None:
+                self.owned_memory = owned
+                self.l1_owned.setdefault(who, {})[phase] = owned.get(who, {}).get("l1_kib_per_core", 0.0)
             log.info("cohost: %s %s: +%.2f GiB/chip DRAM (total %.2f); L1 held %s KiB/core",
                      who, phase, after - before, after, l1)
             if os.environ.get("TT_COHOST_L1_REPORT"):
@@ -461,6 +499,8 @@ class Host:
             "boot": self.boot,
             "failure": self.failure,
             "plugin_hooks": self.hooks,
+            "l1_kib_per_core_owned": self.l1_owned,
+            "memory_by_owner": self.owned_memory,
         }
 
     def serve_status(self) -> None:
