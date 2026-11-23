@@ -34,6 +34,11 @@ def _timing():
 _FRONT = _timing()
 
 
+def _worker_num_gpu_blocks_override(wrapper) -> int | None:
+    """Runs in the host on the member's worker wrapper."""
+    return getattr(wrapper, "worker", wrapper).cache_config.num_gpu_blocks_override
+
+
 class _RemoteOutputFuture(Future):
     """Resolved on first ``result()`` by asking the host for the deferred output (as UniProc does)."""
 
@@ -101,6 +106,16 @@ class RemoteExecutor(UniProcExecutor):
         fut = Future()
         fut.set_result(result if single_value else [result])
         return fut
+
+    def determine_available_memory(self) -> list[int]:
+        # Older TT plugins return a dummy byte count and set the real KV block count on the worker's cache_config,
+        # which reaches the engine only when the worker shares its process. Mirror it here, as UniProc would see it.
+        available = super().determine_available_memory()
+        blocks = self.collective_rpc(_worker_num_gpu_blocks_override, single_value=True)
+        cache_config = self.vllm_config.cache_config
+        if blocks is not None and cache_config.num_gpu_blocks_override != blocks:
+            cache_config.num_gpu_blocks_override = blocks
+        return available
 
     def check_health(self) -> None:
         self._client.call("ping")
