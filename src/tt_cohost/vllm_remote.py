@@ -66,7 +66,11 @@ class RemoteExecutor(UniProcExecutor):
             distributed_init_method=distributed_init_method, is_driver_worker=True))
         self._client.call("run", method="init_device")
         self._client.call("run", method="load_model")
-        current_platform.update_block_size_for_backend(self.vllm_config)
+        # As UniProcExecutor does on vLLM builds that have it; older TT platforms lack it (vLLM's platform proxy then
+        # warns and hands back None).
+        update = getattr(current_platform, "update_block_size_for_backend", None)
+        if callable(update):
+            update(self.vllm_config)
 
     def collective_rpc(  # type: ignore[override]
         self,
