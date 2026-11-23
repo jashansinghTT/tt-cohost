@@ -170,3 +170,11 @@ def test_a_vllm_member_whose_init_worker_fails_fails_the_gates(tmp_path, monkeyp
     assert host.boot["a"]["status"] == "failed" and host.boot["a"]["phase"] == "init"
     with pytest.raises(hostmod.BarrierFailed, match="cohost_llm"):
         host.loaded.wait("b")
+
+
+def test_an_unwritable_status_file_never_fails_a_boot_step(tmp_path, monkeypatch):
+    monkeypatch.setenv("TT_COHOST_STATUS_FILE", str(tmp_path / "missing-dir" / "status.json"))
+    host = hostmod.Host(_cfg())
+    host.enter_phase("a", "load")
+    host.member_failed("a", RuntimeError("out of DRAM"))
+    assert host.boot["a"]["status"] == "failed"

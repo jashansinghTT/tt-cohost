@@ -361,10 +361,19 @@ class Host:
         if not self.status_file:
             return
         with self._status_lock:
-            tmp = f"{self.status_file}.tmp"
-            with open(tmp, "w") as f:
-                json.dump(self.status(), f, indent=1, default=str)
-            os.replace(tmp, self.status_file)
+            for _ in range(3):      # other threads update the record while it is serialized
+                try:
+                    text = json.dumps(self.status(), indent=1, default=str)
+                    tmp = f"{self.status_file}.tmp"
+                    with open(tmp, "w") as f:
+                        f.write(text)
+                    os.replace(tmp, self.status_file)
+                    return
+                except RuntimeError:
+                    continue
+                except OSError as e:        # the status file must never take a boot down
+                    log.warning("cohost: could not write %s: %s", self.status_file, e)
+                    return
 
     # --------------------------------------------------------------- status
     def status(self) -> dict:
