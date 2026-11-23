@@ -105,18 +105,41 @@ class Host:
     # ------------------------------------------------------------------ mesh
     def open_mesh(self, *args, **kwargs):
         """Open the group's one mesh on the device thread (first caller wins). A vLLM worker's call passes its
-        own arguments through (the plugin's trace mode, the model's fabric config); without arguments the mesh
-        opens with the group's tt_config."""
+        own arguments through (the plugin's trace mode, the model's fabric config), with the group's tt_config
+        on top (see ``_group_mesh_args``); without arguments the mesh opens with the group's tt_config."""
         def _open():
             if self.mesh is None:
                 os.environ["MESH_DEVICE"] = self.cfg.mesh_device
-                self.mesh = self._open_mesh(*args, **kwargs) if args or kwargs else \
-                    self._open_mesh(self.cfg.tt_config, "all")
+                if args or kwargs:
+                    a, k = self._group_mesh_args(args, kwargs)
+                    self.mesh = self._open_mesh(*a, **k)
+                else:
+                    self.mesh = self._open_mesh(self.cfg.tt_config, "all")
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device,
                          self.mesh.get_num_devices())
                 self.mesh_ready.set()
             return self.mesh
         return self.device.run("host", _open)
+
+    def _group_mesh_args(self, args, kwargs):
+        """The opening worker's arguments for the plugin's ``open_mesh_device(tt_config, trace_mode, ...)``, with
+        every key of the group's tt_config overriding that worker's own. The mesh serves every member, so its
+        trace region, fabric and L1 settings must not depend on which member happens to open it first (a member
+        without its own trace_region_size would otherwise leave the whole group the plugin's 50 MB default)."""
+        group = self.cfg.tt_config or {}
+        if not group:
+            return args, kwargs
+        args, kwargs = list(args), dict(kwargs)
+        if args:
+            args[0] = {**(args[0] or {}), **group}
+        else:
+            kwargs["tt_config"] = {**(kwargs.get("tt_config") or {}), **group}
+        if "trace_region_size" in group:      # the plugin sizes the trace region only for a tracing trace mode
+            if len(args) > 1 and args[1] not in ("all", "decode_only"):
+                args[1] = "all"
+            elif len(args) <= 1 and kwargs.get("trace_mode", "all") not in ("all", "decode_only"):
+                kwargs["trace_mode"] = "all"
+        return tuple(args), kwargs
 
     def open_mesh_direct(self):
         """Open the group's mesh with ttnn alone (an app-only group has no vLLM plugin)."""

@@ -579,3 +579,34 @@ def test_a_vllm_workers_mesh_open_passes_its_own_arguments(tmp_path, monkeypatch
     assert ttw.open_mesh_device("ignored", "second") is mesh            # first caller wins
     assert seen == [(({"fabric_config": "FABRIC_1D"}, "all", 0), {"model_fabric_config": "X"})]
     assert host.mesh_ready.is_set()
+
+
+def test_the_groups_tt_config_wins_over_the_worker_that_happens_to_open_the_mesh(tmp_path, monkeypatch):
+    """The first member to reach init_device opens the mesh. Without the group's settings on top, a member with
+    no trace_region_size of its own leaves every member the plugin's 50 MB default trace region."""
+    seen = []
+    mesh = types.SimpleNamespace(get_num_devices=lambda: 4)
+    ttw = types.SimpleNamespace(open_mesh_device=lambda *a, **k: seen.append((a, k)) or mesh,
+                                close_mesh_device=None, get_num_available_blocks_tt=lambda cfg, n=1: 1)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    group = {"fabric_config": "FABRIC_1D_RING", "trace_region_size": 950000000}
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, tt_config=group)))
+    host.install_mesh_hooks()
+    ttw.open_mesh_device({"trace_mode": "decode_only", "fabric_config": "FABRIC_1D"}, "decode_only", 0,
+                         model_fabric_config="X")
+    assert seen == [(({"trace_mode": "decode_only", "fabric_config": "FABRIC_1D_RING",
+                       "trace_region_size": 950000000}, "decode_only", 0), {"model_fabric_config": "X"})]
+
+
+def test_a_non_tracing_opener_still_gets_the_groups_trace_region(tmp_path, monkeypatch):
+    seen = []
+    ttw = types.SimpleNamespace(open_mesh_device=lambda *a, **k: seen.append((a, k)) or
+                                types.SimpleNamespace(get_num_devices=lambda: 1),
+                                close_mesh_device=None, get_num_available_blocks_tt=lambda cfg, n=1: 1)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, tt_config={"trace_region_size": 1000})))
+    host.install_mesh_hooks()
+    ttw.open_mesh_device(tt_config=None, trace_mode="none")
+    assert seen == [((), {"tt_config": {"trace_region_size": 1000}, "trace_mode": "all"})]
