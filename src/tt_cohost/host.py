@@ -41,6 +41,30 @@ MESH_SHAPES = {"P150": (1, 1), "P100": (1, 1), "N150": (1, 1), "P300": (1, 2), "
                "N300": (1, 2), "P150x4": (1, 4), "P300x2": (1, 4), "QB2": (1, 4), "P150x8": (1, 8)}
 
 
+class BarrierFailed(RuntimeError):
+    """A phase gate failed because another member failed; that member is the cause."""
+
+
+class BarrierTimeout(TimeoutError):
+    """A phase gate timed out; ``missing`` are the members that never arrived."""
+
+    def __init__(self, name: str, missing: List[str]):
+        super().__init__(f"barrier {name}: {missing} never arrived")
+        self.missing = missing
+
+
+class MemberOpenedDevice(RuntimeError):
+    """A member tried to open a device while the group's mesh is open."""
+
+
+#: What a vLLM worker call is part of, for the boot record.
+METHOD_PHASE = {"init_worker": "init", "init_device": "open", "load_model": "load",
+                "determine_available_memory": "kv_cache", "get_kv_cache_spec": "kv_cache",
+                "initialize_from_config": "kv_cache", "compile_or_warm_up_model": "compile"}
+#: ttnn calls that open a device; after the group's mesh is open they fail for whoever calls them.
+DEVICE_OPENERS = ("open_mesh_device", "open_device", "CreateDevice", "CreateDevices")
+
+
 class Barrier:
     """Phase gate: ``wait`` returns once every expected member has arrived, or raises."""
 
@@ -57,7 +81,8 @@ class Barrier:
 
     def fail(self, why: str) -> None:
         with self._cv:
-            self._failed = why
+            if self._failed is None:            # the first failure is the cause; later ones follow from it
+                self._failed = why
             self._cv.notify_all()
 
     def wait(self, who: str) -> None:
@@ -68,10 +93,10 @@ class Barrier:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     missing = sorted(self.expected - self._arrived)
-                    raise TimeoutError(f"barrier {self.name}: {missing} never arrived")
+                    raise BarrierTimeout(self.name, missing)
                 self._cv.wait(left)
             if self._failed:
-                raise RuntimeError(f"barrier {self.name} failed: {self._failed}")
+                raise BarrierFailed(f"barrier {self.name} failed: {self._failed}")
 
 
 class Host:
@@ -93,6 +118,18 @@ class Host:
         self.dram: Dict[str, Dict[str, float]] = {}
         self.l1: Dict[str, Optional[float]] = {}
         self.dram_total: Optional[float] = None
+        #: L1 held on each core after each of a member's phases (KiB; every member's buffers, not just its own).
+        self.l1_phases: Dict[str, Dict[str, float]] = {}
+        #: Boot record per member: the phase it is in, ``booting``/``ok``/``failed``/``timeout``/``aborted``, and
+        #: why. ``failure`` is the first member that failed on its own (``aborted`` members only followed it).
+        self.boot: Dict[str, Dict[str, Any]] = {n: {"phase": "start", "status": "booting", "error": None}
+                                                for n in names}
+        self.failure: Optional[Dict[str, str]] = None
+        #: The status JSON is also written here on every change (``TT_COHOST_STATUS_FILE``), so a fit check can
+        #: read why a group failed after its process is gone.
+        self.status_file = os.environ.get("TT_COHOST_STATUS_FILE") or None
+        self._status_lock = threading.Lock()
+        self._device_openers: Dict[str, Callable] = {}
         #: Mixed groups: set once every app member has loaded. A vLLM member's ``load_model`` waits for it, so
         #: the apps' weights are in DRAM before any vLLM member sizes and allocates its KV pool.
         self.apps_loaded = threading.Event()
@@ -114,6 +151,7 @@ class Host:
                     self._open_mesh(self.cfg.tt_config, "all")
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device,
                          self.mesh.get_num_devices())
+                self.guard_device_opens()
                 self.mesh_ready.set()
             return self.mesh
         return self.device.run("host", _open)
@@ -139,6 +177,7 @@ class Host:
                         ttnn.set_fabric_config(ttnn.FabricConfig.DISABLED)
                 self._close_mesh = close
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device, self.mesh.get_num_devices())
+                self.guard_device_opens()
                 self.mesh_ready.set()
             return self.mesh
         return self.device.run("host", _open)
@@ -161,9 +200,36 @@ class Host:
             return n
         ttw.get_num_available_blocks_tt = capped_blocks
 
+    def guard_device_opens(self) -> None:
+        """From now on a member that opens a device itself fails at once, by name, instead of fighting the
+        group for the chips. Device thread only."""
+        try:
+            import ttnn
+        except ImportError:        # no ttnn, no device to open
+            return
+        host = self
+        for attr in DEVICE_OPENERS:
+            orig = getattr(ttnn, attr, None)
+            if orig is None or attr in self._device_openers:
+                continue
+
+            def refuse(*_a, _attr=attr, **_k):
+                raise MemberOpenedDevice(f"{host.device.owner or 'a member'} called ttnn.{_attr} while the group's "
+                                         "mesh is open; a co-host member must use the mesh it is given")
+            self._device_openers[attr] = orig
+            setattr(ttnn, attr, refuse)
+
+    def _unguard_device_opens(self) -> None:
+        if self._device_openers:
+            import ttnn
+            for attr, orig in self._device_openers.items():
+                setattr(ttnn, attr, orig)
+            self._device_openers.clear()
+
     def close(self) -> None:
         """Close the shared mesh exactly once (a mesh left open wedges the ethernet cores)."""
         def _close():
+            self._unguard_device_opens()
             if self.mesh is not None and self._close_mesh is not None:
                 self._close_mesh(self.mesh, self.cfg.tt_config)
                 self.mesh = None
@@ -236,6 +302,8 @@ class Host:
             self.dram_total = after
             self.dram.setdefault(who, {})[phase] = round(after - before, 3)
             self.l1[who] = l1
+            if l1 is not None:
+                self.l1_phases.setdefault(who, {})[phase] = l1
             log.info("cohost: %s %s: +%.2f GiB/chip DRAM (total %.2f); L1 held %s KiB/core",
                      who, phase, after - before, after, l1)
             if os.environ.get("TT_COHOST_L1_REPORT"):
@@ -250,6 +318,54 @@ class Host:
         log.info("cohost: L1 buffers after %s (%d): %s", when, len(rows),
                  ", ".join(f"{a}+{n}({lay.split('.')[-1]})" for a, n, lay in rows) or "none")
 
+    # ---------------------------------------------------------- boot record
+    def enter_phase(self, who: str, phase: str) -> None:
+        b = self.boot.get(who)
+        if b is not None and b["status"] == "booting" and b["phase"] != phase:
+            b["phase"] = phase
+            self.write_status()
+
+    def member_failed(self, who: str, exc: BaseException, phase: Optional[str] = None) -> None:
+        """Record why ``who`` failed. A failure that only followed another member's (a failed or timed-out
+        phase gate) is ``aborted``; a timed-out gate names the members that never arrived."""
+        if isinstance(exc, BarrierTimeout):
+            for m in exc.missing:
+                self._fail(m, "timeout", f"did not finish {self.boot.get(m, {}).get('phase', '?')} within "
+                                         f"{BARRIER_TIMEOUT_S:.0f} s ({exc})")
+            self._fail(who, "aborted", str(exc), phase)
+        elif isinstance(exc, BarrierFailed):
+            self._fail(who, "aborted", str(exc), phase)
+        else:
+            self._fail(who, "failed", f"{type(exc).__name__}: {exc}", phase)
+        self.write_status()
+
+    def _fail(self, who: str, status: str, error: str, phase: Optional[str] = None) -> None:
+        b = self.boot.get(who)
+        if b is None or b["status"] not in ("booting", "ok"):     # the first cause stays
+            return
+        b.update(status=status, error=error)
+        if phase:
+            b["phase"] = phase
+        if status != "aborted" and self.failure is None:
+            self.failure = {"member": who, "phase": b["phase"], "error": error}
+
+    def member_ready(self, who: str) -> None:
+        self.ready.add(who)
+        b = self.boot.get(who)
+        if b is not None and b["status"] == "booting":
+            b.update(status="ok", phase="ready")
+        self.write_status()
+
+    def write_status(self) -> None:
+        """Write the status JSON to ``TT_COHOST_STATUS_FILE`` (atomically), if set."""
+        if not self.status_file:
+            return
+        with self._status_lock:
+            tmp = f"{self.status_file}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.status(), f, indent=1, default=str)
+            os.replace(tmp, self.status_file)
+
     # --------------------------------------------------------------- status
     def status(self) -> dict:
         return {
@@ -261,6 +377,9 @@ class Host:
             # cached from the device thread: ttnn is only ever called there
             "dram_gib_per_chip": {"members": self.dram, "total": self.dram_total},
             "l1_kib_per_core_after_phase": self.l1,
+            "l1_kib_per_core": self.l1_phases,
+            "boot": self.boot,
+            "failure": self.failure,
         }
 
     def serve_status(self) -> None:
@@ -358,7 +477,8 @@ class VllmMember:
                     self.timing.add(req.get("method") if req["op"] == "run" else req["op"], time.perf_counter() - t0)
                 except BaseException as e:  # noqa: BLE001 - every failure goes back to the frontend
                     log.exception("cohost: %s %s failed", self.name, req.get("method", req["op"]))
-                    if req.get("method") in self.LOAD_TIME:
+                    if req["op"] == "init_worker" or req.get("method") in self.LOAD_TIME:
+                        self.host.member_failed(self.name, e)       # before the gates, so the cause is first
                         self.host.loaded.fail(f"{self.name}: {e}")
                         self.host.compiled.fail(f"{self.name}: {e}")
                     reply = rpc.error(e)
@@ -376,6 +496,7 @@ class VllmMember:
         if op == "ping":
             return "pong"
         if op == "init_worker":
+            self.host.enter_phase(self.name, "init")
             return self._init_worker(req["kwargs"])
         if op == "get_output":
             out = self._refs.pop(req["ref"])
@@ -383,6 +504,8 @@ class VllmMember:
         if op != "run":
             raise ValueError(f"unknown op {op!r}")
         method, args, kwargs = req["method"], req.get("args", ()), req.get("kwargs") or {}
+        if method in METHOD_PHASE:
+            self.host.enter_phase(self.name, METHOD_PHASE[method])
         if method == "compile_or_warm_up_model":
             return self._phased_warmup()
         if method == "execute_model":
@@ -518,6 +641,7 @@ class VllmMember:
             self._on_device(lambda: self.host.account(self.name, "compile", before))
             log.info("cohost: %s compiled", self.name)
         self.host.compiled.wait(self.name)
+        self.host.enter_phase(self.name, "capture")
         with self.host.capture_turn(self.name):   # taken even with nothing to capture: later members wait on it
             if warm:
                 before = self._on_device(self.host.dram_gb_per_chip)
@@ -526,6 +650,7 @@ class VllmMember:
                 log.info("cohost: %s traces captured", self.name)
         if self.name == self.host.capture_order[-1]:
             self._on_device(self.host.after_all_captured)
+        self.host.enter_phase(self.name, "start-server")
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
 
 
