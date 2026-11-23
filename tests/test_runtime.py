@@ -655,3 +655,17 @@ def test_the_remote_executor_starts_on_vllm_builds_with_and_without_the_block_si
     assert calls == ["init_worker", "init_device", "load_model"]
     assert updated == (["cfg"] if has_hook else [])
     sys.modules.pop("tt_cohost.vllm_remote", None)
+
+
+def test_the_kv_cap_works_with_a_plugin_whose_block_count_takes_only_the_config(tmp_path, monkeypatch):
+    """Older plugins define get_num_available_blocks_tt(vllm_config), newer ones add num_devices."""
+    ttw = types.SimpleNamespace(open_mesh_device=None, close_mesh_device=None,
+                                get_num_available_blocks_tt=lambda vllm_config: 1000)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    members = [{"name": "a", "kind": "vllm", "port": 1, "kv_tokens": 6400}, {"name": "b", "kind": "vllm", "port": 2}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    host.install_mesh_hooks()
+    vcfg = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=64))
+    assert host.device.run("a", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 100
+    assert host.device.run("b", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 1000
