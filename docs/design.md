@@ -46,11 +46,11 @@ environment variable:
 
 | member key | meaning |
 |---|---|
-| `kind` | `vllm` (served by vLLM) or `app` (its own ASGI app). One group holds one kind. |
+| `kind` | `vllm` (served by vLLM) or `app` (its own ASGI app). A group may mix them; it then lists its vLLM members first. |
 | `model`, `args` | vllm: what `vllm serve` gets |
 | `env` | applied while this member loads, and in its vLLM frontend |
 | `kv_tokens` | vllm: cap on this member's KV pool, so the members' DRAM adds up |
-| `preload` | `module:function` called before this member is built (an image-side fit patch) |
+| `preload` | `module:function` called before this member is built (a fit patch shipped next to the model) |
 | `app` | app: `module:factory` returning an `AppMember` |
 
 `python -m tt_cohost.launch` boots the group, prints `cohost: all members ready`, and
@@ -150,9 +150,10 @@ Whisper's text was identical, also with all three requests sent at once. Togethe
   a chip into sub-devices would let them overlap, but every model op would have to be confined
   to its cores (about 150-200 grid sites per model today).
 - **It does not mix tt-metal builds.** One process means one ttnn. Every member must run on the
-  image's tt-metal tree.
-- **It does not share chips across packages.** Two separately published packages cannot share
-  chips. Put the models in one co-host package.
+  tt-metal build of the environment the host runs in.
+- **Every member is importable in one environment.** Models that need different Python
+  environments (or that start their own server process) cannot share a host; serve them on
+  separate chips.
 - **It costs the fastest single-model paths.** A model that keeps state in L1 between steps
   must turn that off. GPT-OSS-20B with `GPT_OSS_20B_FUSED_B1=0` gives 1444 tok/s at 32 users,
   against 1753 tok/s for the published 4-chip throughput profile, which uses the fused path.
