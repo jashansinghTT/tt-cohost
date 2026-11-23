@@ -682,7 +682,10 @@ class VllmMember:
     # --------------------------------------------------- phased warmup
     def _phased_warmup(self):
         """The plugin's warmup split across the group: every member compiles, then each captures in turn."""
-        from vllm.v1.worker.worker_base import CompilationTimes
+        try:
+            from vllm.v1.worker.worker_base import CompilationTimes
+        except ImportError:   # older vLLM: compile_or_warm_up_model returns nothing
+            CompilationTimes = None
 
         worker = self.wrapper.worker
         start = time.perf_counter()
@@ -718,6 +721,8 @@ class VllmMember:
         if self.name == self.host.capture_order[-1]:
             self._on_device(self.host.after_all_captured)
         self.host.enter_phase(self.name, "start-server")
+        if CompilationTimes is None:
+            return None
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
 
     def _legacy_passes(self, worker):
@@ -732,7 +737,7 @@ class VllmMember:
             TTPlatform.check_and_update_config(self.vllm_config)  # this member's sampling mode
             sod = getattr(TTPlatform, "sample_on_device_mode", None)
             prefill = dict(kv_cache=runner.kv_caches, can_sample_on_device=sod == "all")
-            decode = dict(kv_cache=runner.kv_caches, max_batch_size=runner.tt_max_batch_size,
+            decode = dict(kv_cache=runner.kv_caches, max_batch_size=_max_batch_size(runner),
                           num_blocks=runner.max_num_blocks_per_req,
                           can_sample_on_device=sod in ("all", "decode_only"))
             if getattr(runner, "supports_device_grammar", False):   # newer plugins: as their warmup_model does
@@ -755,6 +760,13 @@ class VllmMember:
                 if runner.trace_mode in ("all", "decode_only"):
                     runner.model.warmup_model_decode(enable_trace=True, **decode)
         return compile_pass, capture_pass, warm
+
+
+def _max_batch_size(runner) -> int:
+    """The decode batch the plugin's own warmup_model uses (older plugins have no tt_max_batch_size)."""
+    if hasattr(runner, "tt_max_batch_size"):
+        return runner.tt_max_batch_size
+    return runner.scheduler_config.max_num_seqs * runner.parallel_config.data_parallel_size
 
 
 def build(cfg: CohostConfig, device: Optional[Device] = None) -> Host:
