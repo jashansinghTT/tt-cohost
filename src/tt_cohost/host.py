@@ -261,9 +261,10 @@ class Host:
         blocks = ttw.get_num_available_blocks_tt
         caps = {m.name: m.kv_tokens for m in self.cfg.members if m.kv_tokens}
 
-        def capped_blocks(vllm_config, num_devices=1):
-            """The plugin's KV block count, capped for the member whose init_device is running."""
-            n = blocks(vllm_config, num_devices)
+        def capped_blocks(vllm_config, *args, **kwargs):
+            """The plugin's KV block count, capped for the member whose init_device is running. Its signature
+            differs between plugin versions ((vllm_config) or (vllm_config, num_devices)): pass through."""
+            n = blocks(vllm_config, *args, **kwargs)
             cap = caps.get(self.device.owner)
             if cap:
                 n = min(n, max(1, cap // vllm_config.cache_config.block_size))
