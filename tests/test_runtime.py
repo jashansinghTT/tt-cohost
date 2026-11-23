@@ -610,3 +610,42 @@ def test_a_non_tracing_opener_still_gets_the_groups_trace_region(tmp_path, monke
     host.install_mesh_hooks()
     ttw.open_mesh_device(tt_config=None, trace_mode="none")
     assert seen == [((), {"tt_config": {"trace_region_size": 1000}, "trace_mode": "all"})]
+
+
+@pytest.mark.parametrize("has_hook", [True, False])
+def test_the_remote_executor_starts_on_vllm_builds_with_and_without_the_block_size_hook(monkeypatch, has_hook):
+    """Older TT platforms have no update_block_size_for_backend; vLLM's platform proxy returns None for it."""
+    updated = []
+    platform = types.SimpleNamespace()
+    if has_hook:
+        platform.update_block_size_for_backend = lambda cfg: updated.append(cfg)
+    else:
+        platform.update_block_size_for_backend = None
+    calls = []
+
+    class Client:
+        def __init__(self, path, timeout_s=600.0):
+            pass
+
+        def call(self, op, **kw):
+            calls.append(kw.get("method", op))
+
+    class UniProcExecutor:
+        pass
+    for name, mod in {"cloudpickle": types.ModuleType("cloudpickle"),
+                      "vllm": types.ModuleType("vllm"),
+                      "vllm.platforms": types.SimpleNamespace(current_platform=platform),
+                      "vllm.v1": types.ModuleType("vllm.v1"), "vllm.v1.executor": types.ModuleType("vllm.v1.executor"),
+                      "vllm.v1.executor.uniproc_executor": types.SimpleNamespace(UniProcExecutor=UniProcExecutor)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "tt_cohost.vllm_remote", raising=False)
+    from tt_cohost import vllm_remote
+    monkeypatch.setattr(vllm_remote.rpc, "Client", Client)
+    monkeypatch.setenv("TT_COHOST_SOCKET", "/nowhere")
+    ex = vllm_remote.RemoteExecutor.__new__(vllm_remote.RemoteExecutor)
+    ex.vllm_config = "cfg"
+    ex._distributed_args = lambda: ("tcp://x", 0, 0)
+    ex._init_executor()
+    assert calls == ["init_worker", "init_device", "load_model"]
+    assert updated == (["cfg"] if has_hook else [])
+    sys.modules.pop("tt_cohost.vllm_remote", None)
