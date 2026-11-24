@@ -88,6 +88,7 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
     l1_owned = status.get("l1_kib_per_core_owned") or {}
     by_owner = status.get("memory_by_owner") or {}
     late = status.get("compiles_after_capture") or {}
+    serve_errors = status.get("serve_errors") or {}
     names = [m["name"] for m in raw_cfg["members"]]
     members: Dict[str, dict] = {}
     for m in raw_cfg["members"]:
@@ -122,7 +123,9 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
         if p is not None:
             e["probe"] = p
             if not p["ok"] and e["status"] == "ok":
-                e.update(status="failed", phase="serve", error=p["error"], error_kind="probe")
+                # the host's exception says why the request failed; the HTTP error only that it did
+                error = (serve_errors.get(n) or {}).get("error") or p["error"]
+                e.update(status="failed", phase="serve", error=error, error_kind="probe")
         e["compiles_after_capture"] = int(late.get(n, 0))
         if e["compiles_after_capture"]:
             msg = f"{n} compiled {e['compiles_after_capture']} program(s) after trace capture"

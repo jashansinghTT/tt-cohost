@@ -7,6 +7,7 @@ FAKE_MODE picks what the group does:
   ok     every member answers /v1/models and /v1/completions; the output depends only on the prompt
   drift  as ok, but with more than one member the second prompt's output changes
   late   as ok, and the status counts programs compiled after capture
+  refuse as ok, but the last member answers every completion with HTTP 500 and its status has the host's error
   clash  the last member fails its compile with tt-metal's L1 clash; the others are aborted; exit 1
   hang   the last member never finishes loading
   crash  exit 1 before the host exists (no status at all)
@@ -30,7 +31,10 @@ status = {"mesh_device": cfg["mesh_device"],
           "members": {n: {"kind": "vllm", "port": 0, "ready": False} for n in names},
           "compiles_after_capture": {}, "dram_gib_per_chip": {"members": {}, "total": None},
           "l1_kib_per_core": {}, "boot": {n: {"phase": "start", "status": "booting", "error": None} for n in names},
-          "failure": None}
+          "failure": None, "serve_errors": {}}
+REFUSED = ("RuntimeError: Found 26 device buffer(s) still alive before replay of trace 0 in memory its capture used. "
+           "These will be corrupted on replay.\nBuffer 62818 [op: ttnn.to_device]: DRAM [0x2664900, 0x2664b00), "
+           "512 B per bank")
 
 
 def write():
@@ -88,6 +92,11 @@ class Member(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if mode == "refuse" and self.server.member == names[-1]:
+            status["serve_errors"][names[-1]] = {"method": "execute_model", "error": REFUSED, "count": 1}
+            write()
+            self.send_error(500, "Internal Server Error")
+            return
         text = f" {req['prompt'][::-1]} ({req['max_tokens']})"
         if mode == "drift" and grouped and req["prompt"] == self.server.prompts_seen.get(1):
             text = text.replace(" ", "_", 1)

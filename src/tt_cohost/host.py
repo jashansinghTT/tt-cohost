@@ -160,6 +160,9 @@ class Host:
         self.boot: Dict[str, Dict[str, Any]] = {n: {"phase": "start", "status": "booting", "error": None}
                                                 for n in names}
         self.failure: Optional[Dict[str, str]] = None
+        #: Per member, the first request that failed after loading (``method``, ``error``) and how many failed:
+        #: the frontend only sees that its request failed (an HTTP 500), not why.
+        self.serve_errors: Dict[str, Dict[str, Any]] = {}
         #: The status JSON is also written here on every change (``TT_COHOST_STATUS_FILE``), so a fit check can
         #: read why a group failed after its process is gone.
         self.status_file = os.environ.get("TT_COHOST_STATUS_FILE") or None
@@ -459,6 +462,13 @@ class Host:
         if status != "aborted" and self.failure is None:
             self.failure = {"member": who, "phase": b["phase"], "error": error}
 
+    def serve_failed(self, who: str, method: str, exc: BaseException) -> None:
+        """Record a failed request of a loaded member; its first error stays, ``count`` counts them all."""
+        e = self.serve_errors.setdefault(who, {"method": method, "error": f"{type(exc).__name__}: {exc}"[:2000],
+                                               "count": 0})
+        e["count"] += 1
+        self.write_status()
+
     def member_ready(self, who: str) -> None:
         self.ready.add(who)
         b = self.boot.get(who)
@@ -499,6 +509,7 @@ class Host:
             "l1_kib_per_core": self.l1_phases,
             "boot": self.boot,
             "failure": self.failure,
+            "serve_errors": self.serve_errors,
             "plugin_hooks": self.hooks,
             "l1_kib_per_core_owned": self.l1_owned,
             "memory_by_owner": self.owned_memory,
@@ -603,6 +614,8 @@ class VllmMember:
                         self.host.member_failed(self.name, e)       # before the gates, so the cause is first
                         self.host.loaded.fail(f"{self.name}: {e}")
                         self.host.compiled.fail(f"{self.name}: {e}")
+                    else:
+                        self.host.serve_failed(self.name, req.get("method", req["op"]), e)
                     reply = rpc.error(e)
                 rpc.send(conn, reply)
         except ConnectionError:
