@@ -141,7 +141,7 @@ def test_an_app_member_that_fails_its_warmup_is_recorded_in_that_phase(monkeypat
 
 def test_a_frontend_that_exits_on_its_own_is_recorded_with_its_exit_code(monkeypatch):
     """No host-side error to name: the member whose server process died is the cause."""
-    monkeypatch.setattr(launch, "frontend_argv", lambda m: [sys.executable, "-c", "import sys; sys.exit(3)"])
+    monkeypatch.setattr(launch, "frontend_argv", lambda m, hooks=None: [sys.executable, "-c", "import sys; sys.exit(3)"])
     host = hostmod.Host(_cfg([{"name": "a", "kind": "vllm", "port": 1, "model": "m"}]))
     stopping, rc = threading.Event(), []
     t = threading.Thread(target=lambda: rc.append(launch._supervise(host.cfg, host, stopping)), daemon=True)

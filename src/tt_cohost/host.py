@@ -65,6 +65,38 @@ METHOD_PHASE = {"init_worker": "init", "init_device": "open", "load_model": "loa
 DEVICE_OPENERS = ("open_mesh_device", "open_device", "CreateDevice", "CreateDevices")
 
 
+def plugin_hooks() -> Dict[str, bool]:
+    """What the installed vllm-tt-plugin offers a co-host: a process-level mesh provider (``mesh_provider``) and
+    compile and capture as separate worker steps (``split_warmup``). Without them the host patches the plugin's
+    internals at run time, as it had to before the plugin had these hooks."""
+    import importlib.util
+    try:
+        provider = importlib.util.find_spec("vllm_tt_plugin.mesh_provider") is not None
+    except (ImportError, ValueError):
+        provider = False
+    try:
+        from vllm_tt_plugin.worker import TTWorker
+        split = hasattr(TTWorker, "compile_model") and hasattr(TTWorker, "capture_model")
+    except ImportError:
+        split = False
+    return {"mesh_provider": provider, "split_warmup": split}
+
+
+class _GroupMesh:
+    """The plugin's mesh provider for a group: every worker's ``acquire`` gets the group's one mesh (the first
+    opens it, as that worker would alone, with the group's tt_config on top); ``release`` leaves it open for the
+    host to close at exit."""
+
+    def __init__(self, host: "Host"):
+        self.host = host
+
+    def acquire(self, tt_config, trace_mode, *, model_fabric_config=None):
+        return self.host.open_mesh(tt_config, trace_mode, model_fabric_config=model_fabric_config)
+
+    def release(self, mesh_device) -> None:
+        pass
+
+
 class Barrier:
     """Phase gate: ``wait`` returns once every expected member has arrived, or raises."""
 
@@ -115,6 +147,9 @@ class Host:
         self.compiles_after_capture: Dict[str, int] = {}
         self.ready: set = set()
         self._open_mesh = self._close_mesh = None
+        self._mesh_tt_config: Optional[dict] = None
+        #: What the installed plugin offers (``plugin_hooks``); set by ``build`` for a group with vLLM members.
+        self.hooks: Dict[str, bool] = {"mesh_provider": False, "split_warmup": False}
         self.dram: Dict[str, Dict[str, float]] = {}
         self.l1: Dict[str, Optional[float]] = {}
         self.dram_total: Optional[float] = None
@@ -152,8 +187,10 @@ class Host:
                 os.environ["MESH_DEVICE"] = self.cfg.mesh_device
                 if args or kwargs:
                     a, k = self._group_mesh_args(args, kwargs)
+                    self._mesh_tt_config = a[0] if a else k.get("tt_config")
                     self.mesh = self._open_mesh(*a, **k)
                 else:
+                    self._mesh_tt_config = self.cfg.tt_config
                     self.mesh = self._open_mesh(self.cfg.tt_config, "all")
                 log.info("cohost mesh %s open: %d devices", self.cfg.mesh_device,
                          self.mesh.get_num_devices())
@@ -209,9 +246,19 @@ class Host:
         return self.device.run("host", _open)
 
     def install_mesh_hooks(self) -> None:
-        """Every TTWorker gets the shared mesh, and none of them may close it."""
+        """Every TTWorker gets the shared mesh, and none of them may close it. With the plugin's mesh provider
+        that is a registered provider; with an older plugin, patches of its opener, its closer and its KV block
+        count (the cap then comes from here instead of vLLM's ``--num-gpu-blocks-override``)."""
         from vllm_tt_plugin import worker as ttw
         self._open_mesh, self._close_mesh = ttw.open_mesh_device, ttw.close_mesh_device
+        if self.hooks["mesh_provider"]:
+            from vllm_tt_plugin import mesh_provider
+            mesh_provider.set_mesh_provider(_GroupMesh(self))
+            log.info("cohost: vllm-tt-plugin hooks: mesh provider, KV caps as --num-gpu-blocks-override, %s",
+                     "split compile/capture" if self.hooks["split_warmup"] else "the host's own phased warmup")
+            return
+        log.info("cohost: vllm-tt-plugin without hooks: patching its mesh open/close and KV block count, %s",
+                 "split compile/capture" if self.hooks["split_warmup"] else "the host's own phased warmup")
         ttw.open_mesh_device = lambda *a, **k: self.open_mesh(*a, **k)
         ttw.close_mesh_device = lambda *a, **k: None
         blocks = ttw.get_num_available_blocks_tt
@@ -258,7 +305,8 @@ class Host:
         def _close():
             self._unguard_device_opens()
             if self.mesh is not None and self._close_mesh is not None:
-                self._close_mesh(self.mesh, self.cfg.tt_config)
+                self._close_mesh(self.mesh, self._mesh_tt_config if self._mesh_tt_config is not None
+                                 else self.cfg.tt_config)
                 self.mesh = None
         self.device.run("host", _close)
 
@@ -424,6 +472,7 @@ class Host:
             "boot": self.boot,
             "failure": self.failure,
             "serve_errors": self.serve_errors,
+            "plugin_hooks": self.hooks,
         }
 
     def serve_status(self) -> None:
@@ -648,16 +697,56 @@ class VllmMember:
 
     # --------------------------------------------------- phased warmup
     def _phased_warmup(self):
-        from vllm_tt_plugin.platform import TTPlatform
+        """The plugin's warmup split across the group: every member compiles, then each captures in turn."""
         try:
             from vllm.v1.worker.worker_base import CompilationTimes
         except ImportError:   # older vLLM: compile_or_warm_up_model returns nothing
             CompilationTimes = None
 
         worker = self.wrapper.worker
-        runner = worker.model_runner
         start = time.perf_counter()
         self.host.loaded.wait(self.name)
+        if hasattr(worker, "compile_model") and hasattr(worker, "capture_model"):
+            log.info("cohost: %s warms up with TTWorker.compile_model / capture_model", self.name)
+
+            def compile_pass():
+                with _member_env(self.member):
+                    worker.compile_model()
+
+            def capture_pass():
+                with _member_env(self.member):
+                    worker.capture_model()
+            warm = True                    # both are no-ops when the member's warmup is off
+        else:
+            log.info("cohost: %s warms up with the runner's warmup_model_prefill/decode (older plugin)", self.name)
+            compile_pass, capture_pass, warm = self._legacy_passes(worker)
+
+        if warm:
+            before = self._on_device(self.host.dram_gb_per_chip)
+            self._on_device(compile_pass)
+            self._on_device(lambda: self.host.account(self.name, "compile", before))
+            log.info("cohost: %s compiled", self.name)
+        self.host.compiled.wait(self.name)
+        self.host.enter_phase(self.name, "capture")
+        with self.host.capture_turn(self.name):   # taken even with nothing to capture: later members wait on it
+            if warm:
+                before = self._on_device(self.host.dram_gb_per_chip)
+                self._on_device(capture_pass)
+                self._on_device(lambda: self.host.account(self.name, "capture", before))
+                log.info("cohost: %s traces captured", self.name)
+        if self.name == self.host.capture_order[-1]:
+            self._on_device(self.host.after_all_captured)
+        self.host.enter_phase(self.name, "start-server")
+        if CompilationTimes is None:
+            return None
+        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
+
+    def _legacy_passes(self, worker):
+        """For plugins without TTWorker.compile_model/capture_model: the two halves of the runner's warmup,
+        called on its model directly (as the plugin's own warmup_model did)."""
+        from vllm_tt_plugin.platform import TTPlatform
+
+        runner = worker.model_runner
         warm = getattr(worker, "enable_model_warmup", True)
 
         def kwargs_for():
@@ -686,26 +775,7 @@ class VllmMember:
                     runner.model.warmup_model_prefill(enable_trace=True, **prefill)
                 if runner.trace_mode in ("all", "decode_only"):
                     runner.model.warmup_model_decode(enable_trace=True, **decode)
-
-        if warm:
-            before = self._on_device(self.host.dram_gb_per_chip)
-            self._on_device(compile_pass)
-            self._on_device(lambda: self.host.account(self.name, "compile", before))
-            log.info("cohost: %s compiled", self.name)
-        self.host.compiled.wait(self.name)
-        self.host.enter_phase(self.name, "capture")
-        with self.host.capture_turn(self.name):   # taken even with nothing to capture: later members wait on it
-            if warm:
-                before = self._on_device(self.host.dram_gb_per_chip)
-                self._on_device(capture_pass)
-                self._on_device(lambda: self.host.account(self.name, "capture", before))
-                log.info("cohost: %s traces captured", self.name)
-        if self.name == self.host.capture_order[-1]:
-            self._on_device(self.host.after_all_captured)
-        self.host.enter_phase(self.name, "start-server")
-        if CompilationTimes is None:
-            return None
-        return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
+        return compile_pass, capture_pass, warm
 
 
 def _max_batch_size(runner) -> int:
@@ -718,6 +788,7 @@ def _max_batch_size(runner) -> int:
 def build(cfg: CohostConfig, device: Optional[Device] = None) -> Host:
     host = Host(cfg, device)
     if any(m.kind == "vllm" for m in cfg.members):
+        host.hooks = plugin_hooks()
         host.install_mesh_hooks()
     for m in cfg.members:
         if m.kind == "vllm":
