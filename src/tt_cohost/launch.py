@@ -129,8 +129,11 @@ def _supervise(cfg, host, stopping: threading.Event) -> int:
         def _boot():
             try:
                 servers.update(boot_apps(host, apps))
-            except BaseException:  # noqa: BLE001 - the group goes down with the failure logged
+            except BaseException as e:  # noqa: BLE001 - the group goes down with the failure logged
                 log.exception("cohost: app boot failed")
+                from .host import BarrierFailed
+                for m in apps:   # the member that failed is recorded already; the others stop with it
+                    host.member_failed(m.name, BarrierFailed(f"the group stopped: {e}"))
                 failed.set()
                 stopping.set()
         threading.Thread(target=_boot, name="tt-cohost-apps", daemon=True).start()
@@ -142,11 +145,15 @@ def _supervise(cfg, host, stopping: threading.Event) -> int:
         dead += [n for n, t in list(servers.items()) if not t.is_alive()]
         if dead:
             log.error("cohost: member(s) %s exited; stopping the group", dead)
+            for n in dead:       # kept only if the host recorded no cause for it
+                code = procs[n].returncode if n in procs else None
+                host.member_failed(n, RuntimeError(f"its server exited (code {code})" if code is not None
+                                                   else "its HTTP server thread ended"))
             rc = 1
             break
         for m in cfg.members:
             if m.name not in host.ready and _answers(m.port, m.kind):
-                host.ready.add(m.name)
+                host.member_ready(m.name)
                 log.info("cohost: %s ready on port %d", m.name, m.port)
         if not announced and len(host.ready) == len(cfg.members):
             print(READY_LINE, flush=True)

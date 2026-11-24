@@ -70,35 +70,51 @@ def serve_asgi(app: Any, port: int, name: str) -> threading.Thread:
     return t
 
 
+def _step(host, m: Member, phase: str, fn: Callable[[], Any]) -> Any:
+    """One boot step of app member ``m``: recorded as its phase; a failure is recorded against it."""
+    host.enter_phase(m.name, phase)
+    try:
+        return fn()
+    except BaseException as e:
+        host.member_failed(m.name, e)
+        raise
+
+
 def boot_apps(host, members: List[Member]) -> Dict[str, threading.Thread]:
     """Load, warm, release and re-warm every app member (see the module docstring), then serve.
     Returns each member's server thread. In a group that also holds vLLM members, see ``_boot_mixed``."""
     apps = []
     for m in members:
-        app = load_factory(m.app)(host, m)
+        app = _step(host, m, "init", lambda m=m: load_factory(m.app)(host, m))
         apps.append((m, app))
     from .host import _member_env
 
     if host.cfg.mixed:
         return _boot_mixed(host, apps)
-    mesh = host.open_mesh_direct()
+    mesh = _step(host, apps[0][0], "open", host.open_mesh_direct)
     for m, app in apps:
-        before = host.device.run(m.name, host.dram_gb_per_chip)
-        with _member_env(m):
-            host.device.run(m.name, lambda: app.load(mesh))
-        host.device.run(m.name, lambda: host.account(m.name, "load", before))
+        def load(m=m, app=app):
+            before = host.device.run(m.name, host.dram_gb_per_chip)
+            with _member_env(m):
+                host.device.run(m.name, lambda: app.load(mesh))
+            host.device.run(m.name, lambda: host.account(m.name, "load", before))
+        _step(host, m, "load", load)
         log.info("cohost: %s load_model: loaded", m.name)
     for rnd in ("compile", "capture"):
         for m, app in apps:
-            before = host.device.run(m.name, host.dram_gb_per_chip)
-            with _member_env(m):
-                host.device.run(m.name, app.warmup)
-            host.device.run(m.name, lambda: host.account(m.name, f"warmup-{rnd}", before))
+            def warm(m=m, app=app):
+                before = host.device.run(m.name, host.dram_gb_per_chip)
+                with _member_env(m):
+                    host.device.run(m.name, app.warmup)
+                host.device.run(m.name, lambda: host.account(m.name, f"warmup-{rnd}", before))
+            _step(host, m, rnd, warm)
             log.info("cohost: %s %s", m.name, "compiled" if rnd == "compile" else "traces captured")
         if rnd == "compile":
             for m, app in apps:
-                host.device.run(m.name, app.release_traces)
+                _step(host, m, "compile", lambda m=m, app=app: host.device.run(m.name, app.release_traces))
     host.device.run("host", host.after_all_captured)
+    for m, _ in apps:
+        host.enter_phase(m.name, "start-server")
     return {m.name: serve_asgi(app.asgi_app(), m.port, m.name) for m, app in apps}
 
 
@@ -128,7 +144,7 @@ def _boot_mixed(host, apps) -> Dict[str, threading.Thread]:
                 with _member_env(m):
                     app.load(mesh)
                 host.account(m.name, "load", before)
-            host.device.run(m.name, load)
+            _step(host, m, "load", lambda m=m, load=load: host.device.run(m.name, load))
             log.info("cohost: %s load_model: loaded", m.name)
     except BaseException as e:
         host.loaded.fail(f"app load: {e}")
@@ -150,10 +166,10 @@ def _boot_mixed(host, apps) -> Dict[str, threading.Thread]:
 
     try:
         for m, app in apps:
-            warm(m, app, "warmup-compile")
+            _step(host, m, "compile", lambda m=m, app=app: warm(m, app, "warmup-compile"))
             log.info("cohost: %s compiled", m.name)
         for m, app in apps:
-            host.device.run(m.name, app.release_traces)
+            _step(host, m, "compile", lambda m=m, app=app: host.device.run(m.name, app.release_traces))
     except BaseException as e:
         host.compiled.fail(f"app compile: {e}")
         raise
@@ -162,8 +178,10 @@ def _boot_mixed(host, apps) -> Dict[str, threading.Thread]:
     host.compiled.wait(names[0])
     for m, app in apps:
         with host.capture_turn(m.name):
-            warm(m, app, "warmup-capture")
+            _step(host, m, "capture", lambda m=m, app=app: warm(m, app, "warmup-capture"))
             log.info("cohost: %s traces captured", m.name)
     if host.capture_order[-1] in names:
         host.device.run("host", host.after_all_captured)
+    for m, _ in apps:
+        host.enter_phase(m.name, "start-server")
     return {m.name: serve_asgi(app.asgi_app(), m.port, m.name) for m, app in apps}

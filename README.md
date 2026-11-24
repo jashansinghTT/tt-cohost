@@ -176,13 +176,87 @@ With `status_port` set, `GET http://<host>:<status_port>/` returns:
 (GPT-OSS-20B + Llama-3.1-8B on a QuietBox 2, after one request each.)
 
 `dram_gib_per_chip` is what each member's phases added to per-chip DRAM; `l1_kib_per_core_after_phase` is
-the L1 held by live buffers after that member's last measured phase. `TT_COHOST_L1_REPORT=1` also logs
-every live L1 buffer after each phase.
+the L1 held by live buffers after that member's last measured phase, and `l1_kib_per_core` the same after each of
+its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`, `timeout`, `aborted`) and error,
+and `failure` the first member that failed on its own. `serve_errors` holds, per member, the first request that
+failed after loading (`method`, the host's `error`) and how many failed (`count`): the member's HTTP server only
+answers such a request with a 500. `TT_COHOST_L1_REPORT=1` also logs every live L1 buffer after each phase.
 
 If a group stops answering, `device_owner` names the member whose call holds the device, and
 `kill -USR1 <launcher pid>` writes every thread's Python stack to the launcher's stderr. The device thread
 (the main thread) inside a ttnn call means the device itself is stuck. Member threads waiting in
 `Device.acquire` behind an idle device thread would be a deadlock in the host.
+
+## Will they fit? The fit check
+
+```bash
+python -m tt_cohost.fit --config group.json --json fit.json
+```
+
+The fit check boots the group exactly as the launcher does (in a child process that owns the chips), sends each
+vLLM member one short greedy request, stops the group and writes a report. The verdict is `shared` when every member
+booted and answered, else `separate` with the member, the phase and the reason. Measured on a QuietBox 2
+(GPT-OSS-20B + Llama-3.1-8B on P150x4, Llama without its fit hook):
+
+```text
+fit: separate: llama8b-nohook failed in compile: L1 clash (its programs need L1 another member holds): Statically
+allocated dataflow buffers in program 2950 clash with L1 buffers on core range [0-0 - 3-0]. L1 buffer allocated at
+1172096 and static dataflow buffer region ends at 1258496
+```
+
+```json
+{
+  "fit_report_version": 1,
+  "verdict": "separate",
+  "fits": false,
+  "reason": "llama8b-nohook failed in compile: L1 clash (its programs need L1 another member holds): Statically ...",
+  "failure": {"member": "llama8b-nohook", "phase": "compile", "kind": "l1_clash", "error": "Statically allocated ..."},
+  "mesh_device": "P150x4",
+  "outcome": "exited",
+  "boot_seconds": 156.0,
+  "dram_gib_per_chip_total": 14.441,
+  "members": {
+    "gptoss": {"kind": "vllm", "port": 20000, "status": "aborted", "phase": "compile", "error_kind": "l1_clash",
+               "dram_gib_per_chip": {"load_model": 7.101, "initialize_from_config": 3.287, "compile": 0.08},
+               "l1_kib_per_core": {"load_model": 370.5, "initialize_from_config": 370.5, "compile": 380.8},
+               "compiles_after_capture": 0, "error": "Statically allocated ...", "error_full": "..."},
+    "llama8b-nohook": {"kind": "vllm", "port": 20002, "status": "failed", "phase": "compile", "error_kind": "l1_clash",
+                       "dram_gib_per_chip": {"load_model": 1.848, "initialize_from_config": 2.125},
+                       "l1_kib_per_core": {"load_model": 4.2, "initialize_from_config": 4.2},
+                       "compiles_after_capture": 0, "error": "Statically allocated ...", "error_full": "..."}
+  },
+  "warnings": []
+}
+```
+
+With Llama's fit hook the same group gives `fit: shared: all 2 members booted on P150x4 and answered` (boot 150.6 s,
+14.47 GiB/chip DRAM).
+
+- Member `status`: `ok`, `failed` (this member is the cause), `timeout` (it never finished its phase), `aborted`
+  (it stopped because another member failed).
+- Phases: `init`, `open`, `load`, `kv_cache`, `compile`, `capture`, `start-server`, `ready`, then `serve` for the
+  probe request. A failed probe quotes the host's error for that request (from the status's `serve_errors`), not
+  the HTTP 500 its client saw; `probe.error` keeps the latter.
+- Failure kinds: `l1_clash`, `dram`, `opens_device`, `timeout`, `server_exited`, `probe`, `late_compile` (only with
+  `--strict`), `device` (a chip that needs a reset: not a fit result; `device_fault` is true), `error`.
+- `l1_kib_per_core` is the L1 held on each core after each of the member's phases, counting every member's buffers.
+- Programs compiled after capture are listed under `warnings`; `--strict` makes them fail the member.
+- Exit code 0 with a verdict either way; 2 when the check itself could not run (an invalid config, a launcher that
+  died before the group existed); 3 when a device fault stopped the boot (reset the chips and run it again).
+  `--timeout` (default 5400 s) bounds the boot; `--workdir` keeps the group's config, log and status.
+
+## Does a model behave next to others? The conformance test
+
+```bash
+python -m tt_cohost.conformance --config group.json --member llama8b --out conformance/
+# llama8b next to gptoss: sequential 16/16 identical, interleaved 16/16 identical: PASS
+```
+
+It serves the member alone (a one-member group on the same mesh, or `--baseline` greedy rows from its own server),
+then with the whole group: the prompts once one at a time and once while every vLLM neighbour answers its own stream
+of requests, so the members' steps interleave on the device. Each prompt's output is compared exactly with the alone
+run. Pass = all identical in both modes. `--prompts` takes a JSON list or one prompt per line (16 built in). Pick a
+neighbour that holds a typical amount of L1. Exit 0 on pass, 1 on a difference, 2 when the test could not run.
 
 ## Environment variables
 
@@ -193,6 +267,7 @@ If a group stops answering, `device_owner` names the member whose call holds the
 | `TT_COHOST_TIMING_S` | `30` | log per-call wall time every N seconds of activity (`0` = off) |
 | `TT_COHOST_L1_REPORT` | | set to log every live L1 buffer after each phase |
 | `TT_COHOST_CONNECT_TIMEOUT_S` | `600` | connect timeout of a vLLM frontend's socket to the host |
+| `TT_COHOST_STATUS_FILE` | | also write the status JSON (with the boot record) to this file on every change |
 
 ## Limits
 

@@ -78,6 +78,9 @@ def test_launch_runs_the_device_on_the_main_thread_and_closes_the_mesh_there(tmp
         def __init__(self, cfg, device):
             self.cfg, self.device, self.ready = cfg, device, set()
 
+        def member_failed(self, who, exc, phase=None):
+            pass
+
         def close(self):
             self.device.run("host", lambda: closed_on.append(threading.current_thread()))
 
@@ -433,7 +436,10 @@ def test_an_app_member_whose_server_thread_ends_takes_the_group_down(tmp_path, m
 
     class FakeHost:
         def __init__(self, cfg):
-            self.cfg, self.ready = cfg, set()
+            self.cfg, self.ready, self.failed = cfg, set(), []
+
+        def member_failed(self, who, exc, phase=None):
+            self.failed.append((who, str(exc)))
 
         def close(self):
             pass
