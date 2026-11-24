@@ -194,7 +194,11 @@ the L1 held by live buffers after that member's last measured phase, and `l1_kib
 its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`, `timeout`, `aborted`) and error,
 and `failure` the first member that failed on its own. `serve_errors` holds, per member, the first request that
 failed after loading (`method`, the host's `error`) and how many failed (`count`): the member's HTTP server only
-answers such a request with a 500. `TT_COHOST_L1_REPORT=1` also logs every live L1 buffer after each phase.
+answers such a request with a 500. With a ttnn that accounts memory per owner (`ttnn.memory_owner`,
+`ttnn.get_memory_usage_by_owner`), every member's device work runs as that member: `l1_kib_per_core_owned` is the L1
+each member's own buffers hold after each of its phases, `memory_by_owner` the latest L1 and DRAM per owner, and a fit
+check that fails on an L1 clash names who holds the L1. `TT_COHOST_L1_REPORT=1` also logs
+every live L1 buffer after each phase.
 
 If a group stops answering, `device_owner` names the member whose call holds the device, and
 `kill -USR1 <launcher pid>` writes every thread's Python stack to the launcher's stderr. The device thread

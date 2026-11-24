@@ -85,6 +85,8 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
     boot = status.get("boot") or {}
     dram = (status.get("dram_gib_per_chip") or {}).get("members") or {}
     l1 = status.get("l1_kib_per_core") or {}
+    l1_owned = status.get("l1_kib_per_core_owned") or {}
+    by_owner = status.get("memory_by_owner") or {}
     late = status.get("compiles_after_capture") or {}
     serve_errors = status.get("serve_errors") or {}
     names = [m["name"] for m in raw_cfg["members"]]
@@ -134,6 +136,8 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
                                       "tt_cohost.conformance)")
         e["dram_gib_per_chip"] = dram.get(n, {})
         e["l1_kib_per_core"] = l1.get(n, {})
+        if n in l1_owned:
+            e["l1_kib_per_core_owned"] = l1_owned[n]
         if e["status"] != "ok" and e.get("error"):
             kind, line = classify(e["error"])
             e["error_kind"] = e.get("error_kind") or kind
@@ -150,6 +154,10 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
     elif culprit:
         e = members[culprit]
         reason = f"{culprit} failed in {e['phase']}: {KIND_TEXT[e['error_kind']]}: {e['error']}"
+        holders = sorted(((o, m.get("l1_kib_per_core", 0)) for o, m in by_owner.items() if m.get("l1_kib_per_core")),
+                         key=lambda x: -x[1])
+        if e["error_kind"] == "l1_clash" and holders:   # ttnn with per-owner accounting names who holds the L1
+            reason += "; L1 held per core: " + ", ".join(f"{o or 'no owner'} {k} KiB" for o, k in holders)
         failure = {"member": culprit, "phase": e["phase"], "kind": e["error_kind"], "error": e["error"]}
     else:
         last = next((ln for ln in reversed(log_tail or []) if ln.strip()), "no output")
@@ -165,6 +173,7 @@ def build_report(raw_cfg: dict, outcome: str, status: Optional[dict], *, probes:
         "outcome": outcome,
         "boot_seconds": boot_seconds,
         "dram_gib_per_chip_total": (status.get("dram_gib_per_chip") or {}).get("total"),
+        "memory_by_owner": by_owner or None,
         "members": members,
         "warnings": warnings,
         "device_fault": bool(failure and failure["kind"] == "device"),

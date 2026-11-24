@@ -32,6 +32,9 @@ class Device:
         self._depth = 0
         self._waiting: collections.deque = collections.deque()
         self._jobs: "queue.Queue[tuple[Optional[Callable[[], Any]], Optional[Future]]]" = queue.Queue()
+        #: Optional ``scope(who)`` context manager every piece of device work runs in, on the device thread (the
+        #: host sets ttnn.memory_owner here, so the buffers a member's work allocates are attributed to it).
+        self.scope: Optional[Callable[[str], Any]] = None
         if own_thread:
             self._thread = threading.Thread(target=self.loop, name="tt-cohost-device", daemon=True)
             self._thread.start()
@@ -87,6 +90,12 @@ class Device:
         Called from the device thread itself (a job that needs more device work), it runs
         inline under the current owner rather than queueing behind itself.
         """
+        if self.scope is not None:
+            inner, scope = fn, self.scope
+
+            def fn():
+                with scope(who):
+                    return inner()
         if threading.current_thread() is self._thread:
             return fn()
         self.acquire(who)
