@@ -6,6 +6,7 @@
 import importlib
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -730,3 +731,18 @@ def test_the_engine_sees_the_kv_block_count_an_older_plugin_sets_on_its_worker(m
     assert ex.determine_available_memory() == [1 << 64]
     assert ex.vllm_config.cache_config.num_gpu_blocks_override == worker_blocks
     sys.modules.pop("tt_cohost.vllm_remote", None)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_sigusr1_dumps_every_threads_stack(capfd):
+    """To tell a device hang from a host deadlock without a debugger in the image."""
+    import faulthandler
+
+    launch.dump_stacks_on_sigusr1()
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.1)
+        err = capfd.readouterr().err
+    finally:
+        faulthandler.unregister(signal.SIGUSR1)
+    assert "most recent call first" in err and "test_sigusr1_dumps_every_threads_stack" in err
