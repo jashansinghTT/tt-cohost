@@ -130,6 +130,11 @@ def factory(host, member):         # named in the config as "app": "my_pkg.cohos
 - Do not change process-wide state while loading, or restore it (one interpreter: a model that points
   `HF_MODEL` at its own weights changes it for every member loaded after it).
 
+Members written for tt-model's runtime import `from tt_kernel.cohost.apps import AppMember`. They load
+unchanged: once `tt_cohost` is imported, `tt_kernel.cohost` and its submodules resolve to the `tt_cohost`
+modules (the same objects), unless an image still ships the old runtime, which is then imported as before.
+New members should import `tt_cohost.apps`.
+
 ## The boot phases, and why
 
 A trace replays the exact addresses it used at capture. A buffer or program binary allocated after some
