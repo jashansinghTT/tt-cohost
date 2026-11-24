@@ -12,6 +12,7 @@ the whole group goes down: the members share the device, so a half-alive group i
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import logging
 import os
 import signal
@@ -66,6 +67,14 @@ def _answers(port: int, kind: str = "vllm") -> bool:
         return False
 
 
+def dump_stacks_on_sigusr1() -> None:
+    """``kill -USR1 <pid>`` writes every thread's Python stack to stderr, also while the device thread is blocked
+    in a ttnn call: a device thread inside ttnn is a device hang, members waiting in Device.acquire behind an idle
+    device thread are not."""
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="tt-cohost")
     ap.add_argument("--config", help="config JSON file (default: the TT_COHOST_CONFIG env, inline JSON)")
@@ -73,6 +82,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s",
                         stream=sys.stdout)
     cfg = load(args.config) if args.config else loads(os.environ["TT_COHOST_CONFIG"])
+    dump_stacks_on_sigusr1()
 
     from . import host as hostmod  # imports vllm/ttnn lazily, after the env above is final
     from .device import Device

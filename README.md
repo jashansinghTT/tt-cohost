@@ -176,6 +176,11 @@ its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`,
 and `failure` the first member that failed on its own. `TT_COHOST_L1_REPORT=1` also logs
 every live L1 buffer after each phase.
 
+If a group stops answering, `device_owner` names the member whose call holds the device, and
+`kill -USR1 <launcher pid>` writes every thread's Python stack to the launcher's stderr. The device thread
+(the main thread) inside a ttnn call means the device itself is stuck. Member threads waiting in
+`Device.acquire` behind an idle device thread would be a deadlock in the host.
+
 ## Will they fit? The fit check
 
 ```bash
