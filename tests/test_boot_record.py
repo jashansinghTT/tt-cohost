@@ -172,6 +172,33 @@ def test_a_vllm_member_whose_init_worker_fails_fails_the_gates(tmp_path, monkeyp
         host.loaded.wait("b")
 
 
+def test_a_request_that_fails_after_loading_is_in_the_status_and_fails_no_gate(tmp_path, monkeypatch):
+    """The frontend only turns it into an HTTP 500; the status keeps the host's exception (the fit report quotes it)."""
+    monkeypatch.setenv("TT_COHOST_STATUS_FILE", str(tmp_path / "status.json"))
+    host = hostmod.Host(_cfg(socket_dir=str(tmp_path / "s")))
+    vm = hostmod.VllmMember(host, host.cfg.members[0])
+    host.member_ready("a")
+    refused = ("Found 26 device buffer(s) still alive before replay of trace 0 in memory its capture used.\n"
+               "Buffer 62818 [op: ttnn.to_device]: DRAM [0x2664900, 0x2664b00), 512 B per bank")
+    errors = iter([RuntimeError(refused), RuntimeError("EngineDeadError")])
+
+    def replay(args, kwargs):
+        raise next(errors)
+    monkeypatch.setattr(vm, "_execute", replay)
+    vm.serve()
+    from tt_cohost import rpc
+    c = rpc.Client(host.cfg.socket_path("a"))
+    for _ in range(2):
+        with pytest.raises(rpc.RemoteError, match="still alive|EngineDeadError"):
+            c.call("run", method="execute_model", args=(), kwargs={})
+    expected = {"method": "execute_model", "error": "RuntimeError: " + refused, "count": 2}
+    assert host.status()["serve_errors"] == {"a": expected}
+    assert json.loads((tmp_path / "status.json").read_text())["serve_errors"] == {"a": expected}
+    assert host.boot["a"]["status"] == "ok" and host.failure is None
+    host.loaded.arrive("a")
+    host.loaded.wait("b")       # no gate was failed
+
+
 def test_an_unwritable_status_file_never_fails_a_boot_step(tmp_path, monkeypatch):
     monkeypatch.setenv("TT_COHOST_STATUS_FILE", str(tmp_path / "missing-dir" / "status.json"))
     host = hostmod.Host(_cfg())

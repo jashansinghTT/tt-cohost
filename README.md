@@ -178,8 +178,9 @@ With `status_port` set, `GET http://<host>:<status_port>/` returns:
 `dram_gib_per_chip` is what each member's phases added to per-chip DRAM; `l1_kib_per_core_after_phase` is
 the L1 held by live buffers after that member's last measured phase, and `l1_kib_per_core` the same after each of
 its phases. `boot` holds each member's phase, status (`booting`, `ok`, `failed`, `timeout`, `aborted`) and error,
-and `failure` the first member that failed on its own. `TT_COHOST_L1_REPORT=1` also logs
-every live L1 buffer after each phase.
+and `failure` the first member that failed on its own. `serve_errors` holds, per member, the first request that
+failed after loading (`method`, the host's `error`) and how many failed (`count`): the member's HTTP server only
+answers such a request with a 500. `TT_COHOST_L1_REPORT=1` also logs every live L1 buffer after each phase.
 
 If a group stops answering, `device_owner` names the member whose call holds the device, and
 `kill -USR1 <launcher pid>` writes every thread's Python stack to the launcher's stderr. The device thread
@@ -234,7 +235,8 @@ With Llama's fit hook the same group gives `fit: shared: all 2 members booted on
 - Member `status`: `ok`, `failed` (this member is the cause), `timeout` (it never finished its phase), `aborted`
   (it stopped because another member failed).
 - Phases: `init`, `open`, `load`, `kv_cache`, `compile`, `capture`, `start-server`, `ready`, then `serve` for the
-  probe request.
+  probe request. A failed probe quotes the host's error for that request (from the status's `serve_errors`), not
+  the HTTP 500 its client saw; `probe.error` keeps the latter.
 - Failure kinds: `l1_clash`, `dram`, `opens_device`, `timeout`, `server_exited`, `probe`, `late_compile` (only with
   `--strict`), `device` (a chip that needs a reset: not a fit result; `device_fault` is true), `error`.
 - `l1_kib_per_core` is the L1 held on each core after each of the member's phases, counting every member's buffers.
