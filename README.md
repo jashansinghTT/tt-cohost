@@ -195,10 +195,12 @@ If a group stops answering, `device_owner` names the member whose call holds the
 - **One ttnn per process.** Every member runs on the same tt-metal, vLLM and plugin builds.
 - **The fastest single-model paths may be off.** A model that keeps state in L1 between steps must turn
   that off in a group (GPT-OSS-20B: `GPT_OSS_20B_FUSED_B1=0`, 1,444 vs. 1,753 tok/s at 32 users alone).
-- **On-device sampling may not survive a neighbour.** In tt-inference-server's 0.17.0 image, Llama-3.1-8B with
-  `sample_on_device_mode: decode_only` next to Qwen3-32B (P300x2) produced garbage from about its third token once
-  their decode steps alternated, and a burst of requests ended in a device timeout. Without that setting the same
-  pair answered identically to the members served one at a time. Run the conformance test before sharing chips.
+- **Some on-device sampling paths do not survive a neighbour.** In tt-inference-server's 0.17.0 image,
+  Llama-3.1-8B with `sample_on_device_mode: decode_only` next to Qwen3-32B (P300x2) produced garbage from about its
+  third token once their decode steps alternated, and a burst of requests ended in a device timeout. Without that
+  setting the same pair answered identically to the members served one at a time. GPT-OSS-20B with
+  `sample_on_device_mode: all` is fine in its group, so this depends on the model and build: run the conformance
+  test before sharing chips.
 - **Late compiles are counted, not prevented.** A program compiled after capture can corrupt a parked
   trace. None was seen in the measured groups (output stayed identical after full benchmark runs), but the
   risk is not ruled out.
