@@ -665,7 +665,10 @@ class VllmMember:
             raise
         if result is None:
             self._sample_pending = True        # released by the matching sample_tokens
-        else:
+            return result
+        try:                                   # the whole step ran here (vLLM builds without sample_tokens steps)
+            self._on_device(lambda: self.host.check_cache(self.name, self._step))
+        finally:
             self.host.device.release(self.name)
         return result
 
