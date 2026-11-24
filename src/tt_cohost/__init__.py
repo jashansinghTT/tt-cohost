@@ -12,7 +12,14 @@ level and declares no hard dependencies.
   and serializes their device work on one device thread.
 - ``vllm_remote``: a vLLM executor whose worker lives in the device host.
 - ``launch``: the container entrypoint. It starts the host, then one vLLM server per member.
+
+Importing the package also lets members written for tt-model's runtime import ``tt_kernel.cohost``
+(see ``_legacy``).
 """
+
+from . import _legacy
 
 #: Version of the JSON group config this runtime reads (whoever writes it: a deploy tool or a person).
 CONFIG_VERSION = 1
+
+_legacy.install()
