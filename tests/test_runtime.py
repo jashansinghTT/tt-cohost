@@ -471,6 +471,26 @@ def test_a_late_compile_is_counted_for_the_member_that_compiled_it_on_the_device
     assert seen == [(True, "a")], "ttnn is only called on the device thread, inside the step"
 
 
+def test_a_late_compile_is_counted_when_execute_model_returns_the_output(tmp_path, fake_vllm):
+    """Older vLLM/plugin builds finish the step in execute_model and never call sample_tokens."""
+    host, vm = _member(tmp_path, {"execute_model": "out"})
+    seen = []
+
+    class Mesh:
+        entries = 10
+
+        def num_program_cache_entries(self):
+            seen.append((threading.current_thread() is host.device._thread, host.device.owner))
+            return self.entries
+
+    host.mesh, host.cache_entries_at_capture = Mesh(), 10
+    host.mesh.entries = 12
+    assert vm.handle({"op": "run", "method": "execute_model"}) == "out"
+    assert host.compiles_after_capture == {"a": 2}
+    assert seen == [(True, "a")]
+    assert host.device.owner is None
+
+
 def test_an_app_request_step_counts_its_late_compiles_on_the_device_thread(tmp_path):
     members = [{"name": "tts", "kind": "app", "port": 1, "app": "x:y"}]
     host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
