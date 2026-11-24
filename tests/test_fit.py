@@ -47,6 +47,18 @@ def test_a_member_stuck_in_load_is_named_when_the_boot_times_out(run):
     assert r["members"]["gptoss"]["status"] == "aborted"
 
 
+def test_a_member_whose_request_fails_is_named_with_the_hosts_error_not_the_http_one(run):
+    r = run("refuse")
+    assert r["verdict"] == "separate" and r["outcome"] == "ready"
+    assert r["failure"] == {"member": "llama8b", "phase": "serve", "kind": "probe",
+                            "error": "RuntimeError: Found 26 device buffer(s) still alive before replay of trace 0 "
+                                     "in memory its capture used. These will be corrupted on replay."}
+    assert r["reason"] == "llama8b failed in serve: it did not answer a request: " + r["failure"]["error"]
+    m = r["members"]["llama8b"]
+    assert "HTTP Error 500" in m["probe"]["error"] and "Buffer 62818" in m["error_full"]
+    assert r["members"]["gptoss"]["status"] == "ok"
+
+
 def test_late_compiles_are_a_warning_unless_strict(run):
     r = run("late")
     assert r["verdict"] == "shared" and r["members"]["gptoss"]["compiles_after_capture"] == 3
