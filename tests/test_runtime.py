@@ -1,0 +1,762 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+"""The co-host runtime's device-free core: config, device ownership, barriers, RPC, lock window."""
+
+import importlib
+import json
+import os
+import signal
+import sys
+import threading
+import time
+import types
+
+import pytest
+
+from tt_cohost import config as cfgmod
+from tt_cohost import host as hostmod
+from tt_cohost import launch, rpc
+from tt_cohost.device import Device
+
+
+def _write(tmp_path, **over):
+    raw = {"cohost_config_version": 1, "mesh_device": "P150x4",
+           "members": [{"name": "a", "kind": "vllm", "port": 21000, "model": "m/a"},
+                       {"name": "b", "kind": "vllm", "port": 21001, "model": "m/b"}]}
+    raw.update(over)
+    p = tmp_path / "cohost.json"
+    p.write_text(json.dumps(raw))
+    return str(p)
+
+
+# ------------------------------------------------------------------------------- config
+
+def test_config_loads_members_in_order(tmp_path):
+    cfg = cfgmod.load(_write(tmp_path))
+    assert [m.name for m in cfg.members] == ["a", "b"]
+    assert cfg.socket_path("a").endswith("/a.sock")
+
+
+@pytest.mark.parametrize("over, match", [
+    ({"cohost_config_version": 2}, "version"),
+    ({"members": [{"name": "a", "kind": "vllm", "port": 1}, {"name": "a", "kind": "vllm", "port": 2}]}, "duplicate"),
+    ({"members": [{"name": "a", "kind": "vllm", "port": 1}, {"name": "b", "kind": "vllm", "port": 1}]}, "distinct ports"),
+    ({"members": [{"name": "a", "kind": "llm", "port": 1}]}, "kind"),
+    ({"members": [{"name": "a", "kind": "app", "port": 1}]}, "module:factory"),
+])
+def test_config_refuses_what_cannot_run(tmp_path, over, match):
+    with pytest.raises(ValueError, match=match):
+        cfgmod.load(_write(tmp_path, **over))
+
+
+# ------------------------------------------------------------------------------- device
+
+def test_device_runs_every_job_on_one_thread():
+    dev = Device()
+    seen = {dev.run("a", lambda: threading.current_thread().name),
+            dev.run("b", lambda: threading.current_thread().name)}
+    assert seen == {"tt-cohost-device"}
+
+
+def test_a_device_without_its_own_thread_runs_jobs_on_the_thread_that_loops_it():
+    dev = Device(own_thread=False)
+    out = []
+    threading.Thread(target=lambda: (out.append(dev.run("a", threading.current_thread)), dev.stop())).start()
+    dev.loop()
+    assert out == [threading.current_thread()]
+
+
+def test_launch_runs_the_device_on_the_main_thread_and_closes_the_mesh_there(tmp_path, monkeypatch):
+    """tt-metal tears the chips down on the main thread at exit; UMD's per-chip lock must be
+    released by the thread that took it, so the mesh is opened and closed on the main thread."""
+    from tt_cohost import apps
+
+    closed_on = []
+
+    class FakeHost:
+        def __init__(self, cfg, device):
+            self.cfg, self.device, self.ready = cfg, device, set()
+
+        def close(self):
+            self.device.run("host", lambda: closed_on.append(threading.current_thread()))
+
+    monkeypatch.setattr(hostmod, "build", lambda cfg, device: FakeHost(cfg, device))
+    monkeypatch.setattr(apps, "boot_apps", lambda host, members: 1 / 0)   # the group goes down
+    members = [{"name": "tts", "kind": "app", "port": 1, "app": "x:y"}]
+    assert launch.main(["--config", str(_write(tmp_path, members=members))]) == 1
+    assert closed_on == [threading.main_thread()]
+
+
+def test_device_ownership_is_reentrant_and_blocks_other_owners():
+    dev = Device()
+    dev.acquire("a")
+    dev.acquire("a")
+    got = threading.Event()
+    t = threading.Thread(target=lambda: (dev.acquire("b"), got.set()))
+    t.start()
+    dev.release("a")
+    assert not got.wait(0.2), "b took the device while a still held it"
+    dev.release("a")
+    assert got.wait(2)
+    assert dev.owner == "b"
+    dev.release("b")
+    t.join()
+
+
+def test_device_hands_ownership_out_first_come_first_served():
+    dev = Device()
+    dev.acquire("x")
+    order = []
+    threads = []
+    for who in ("a", "b", "c"):
+        th = threading.Thread(target=lambda w=who: (dev.acquire(w), order.append(w), dev.release(w)))
+        th.start()
+        threads.append(th)
+        time.sleep(0.05)
+    dev.release("x")
+    for th in threads:
+        th.join(2)
+    assert order == ["a", "b", "c"]
+
+
+def test_a_members_second_concurrent_request_waits_its_turn_behind_other_members():
+    """An app member's requests run on several server threads; re-entry by name would starve the others."""
+    dev = Device()
+    dev.acquire("a")
+    order = []
+    tb = threading.Thread(target=lambda: (dev.acquire("b"), order.append("b"), dev.release("b")))
+    tb.start()
+    time.sleep(0.05)
+    ta = threading.Thread(target=lambda: (dev.acquire("a"), order.append("a again"), dev.release("a")))
+    ta.start()
+    time.sleep(0.05)
+    dev.release("a")
+    tb.join(2)
+    ta.join(2)
+    assert order == ["b", "a again"]
+
+
+def test_device_work_nested_inside_a_job_runs_inline_instead_of_deadlocking():
+    """A member's init_device job opens the shared mesh, which is itself device work."""
+    dev = Device()
+    done = threading.Event()
+    t = threading.Thread(target=lambda: (dev.run("member", lambda: dev.run("host", lambda: 42)), done.set()))
+    t.start()
+    assert done.wait(2), "nested device work deadlocked"
+
+
+# ------------------------------------------------------------------------------ barrier
+
+def test_barrier_releases_only_when_everyone_arrived():
+    b = hostmod.Barrier("loaded", ["a", "b"])
+    done = []
+    t = threading.Thread(target=lambda: (b.wait("a"), done.append("a")))
+    t.start()
+    time.sleep(0.1)
+    assert not done
+    b.wait("b")
+    t.join(2)
+    assert done == ["a"]
+
+
+def test_a_failed_member_fails_the_barrier_for_everyone():
+    b = hostmod.Barrier("loaded", ["a", "b"])
+    b.fail("b: out of DRAM")
+    with pytest.raises(RuntimeError, match="out of DRAM"):
+        b.wait("a")
+
+
+# ---------------------------------------------------------------------------------- rpc
+
+def test_rpc_round_trip_and_remote_errors_carry_the_host_traceback(tmp_path):
+    path = str(tmp_path / "s.sock")
+    srv = rpc.listen(path)
+
+    def serve():
+        conn = rpc.accept(srv)
+        for _ in range(2):
+            req = rpc.recv(conn)
+            try:
+                if req["op"] == "boom":
+                    raise KeyError("no such ref")
+                rpc.send(conn, rpc.ok({"echo": req["x"]}))
+            except KeyError as e:
+                rpc.send(conn, rpc.error(e))
+    threading.Thread(target=serve, daemon=True).start()
+    c = rpc.Client(path)
+    assert c.call("echo", x=b"\x00" * 100_000) == {"echo": b"\x00" * 100_000}
+    with pytest.raises(rpc.RemoteError, match="no such ref") as err:
+        c.call("boom")
+    assert "device host traceback" in str(err.value)
+
+
+def test_the_host_socket_is_private_and_drops_peers_of_another_user(tmp_path, monkeypatch):
+    path = str(tmp_path / "socks" / "a.sock")
+    srv = rpc.listen(path)
+    assert (tmp_path / "socks").stat().st_mode & 0o777 == 0o700
+    uid = os.getuid()
+    monkeypatch.setattr(rpc.os, "getuid", lambda: uid + 1)   # so this test's own client is a stranger
+    accepted = []
+    threading.Thread(target=lambda: accepted.append(rpc.accept(srv)), daemon=True).start()
+    c = rpc.Client(path)
+    c._sock.settimeout(10)                                   # an accepted stranger would hang here
+    with pytest.raises(ConnectionError):
+        c.call("ping")
+    assert accepted == [], "a peer of another user reached the pickle frames"
+
+
+# ------------------------------------------------------------- step-long device ownership
+
+@pytest.fixture
+def fake_vllm(monkeypatch):
+    """Just the vLLM names the host imports, so the lock window is testable without vLLM."""
+    class AsyncModelRunnerOutput:
+        def get_output(self):
+            return "resolved"
+
+    calls = []
+
+    def run_method(obj, method, args, kwargs):
+        calls.append(method)
+        return obj.results[method]
+
+    mods = {
+        "vllm": types.ModuleType("vllm"), "vllm.v1": types.ModuleType("vllm.v1"),
+        "vllm.v1.outputs": types.SimpleNamespace(AsyncModelRunnerOutput=AsyncModelRunnerOutput),
+        "vllm.v1.serial_utils": types.SimpleNamespace(run_method=run_method),
+    }
+    for k, v in mods.items():
+        monkeypatch.setitem(sys.modules, k, v)
+    return types.SimpleNamespace(calls=calls, Async=AsyncModelRunnerOutput)
+
+
+def _member(tmp_path, results, **over):
+    cfg = cfgmod.load(_write(tmp_path, **over))
+    host = hostmod.Host(cfg)
+    vm = hostmod.VllmMember(host, cfg.members[0])
+    vm.wrapper = types.SimpleNamespace(results=results)
+    return host, vm
+
+
+def test_a_pending_sample_keeps_the_device_until_sample_tokens(tmp_path, fake_vllm):
+    host, vm = _member(tmp_path, {"execute_model": None, "sample_tokens": "out"})
+    assert vm.handle({"op": "run", "method": "execute_model", "args": ("so",)}) is None
+    assert host.device.owner == "a", "another member's replay could land before the readback"
+    assert vm.handle({"op": "run", "method": "sample_tokens", "args": (None,)}) == "out"
+    assert host.device.owner is None
+
+
+def test_a_frontend_that_drops_mid_step_gives_the_device_back(tmp_path, fake_vllm):
+    """Otherwise every other member, and the mesh close at exit, waits on it forever."""
+    host, vm = _member(tmp_path, {"execute_model": None}, socket_dir=str(tmp_path / "socks"))
+    vm.serve()
+    c = rpc.Client(host.cfg.socket_path("a"))
+    assert c.call("run", method="execute_model", args=("so",)) is None
+    assert host.device.owner == "a"
+    c.close()
+    deadline = time.time() + 5
+    while host.device.owner is not None and time.time() < deadline:
+        time.sleep(0.05)
+    assert host.device.owner is None
+
+
+def test_a_step_with_nothing_to_sample_releases_at_once(tmp_path, fake_vllm):
+    host, vm = _member(tmp_path, {"execute_model": "EMPTY"})
+    assert vm.handle({"op": "run", "method": "execute_model"}) == "EMPTY"
+    assert host.device.owner is None
+
+
+def test_deferred_outputs_come_back_as_a_ref_and_resolve_on_request(tmp_path, fake_vllm):
+    host, vm = _member(tmp_path, {"sample_tokens": fake_vllm.Async()})
+    ref = vm.handle({"op": "run", "method": "sample_tokens"})
+    assert set(ref) == {"__cohost_async_ref__"}
+    assert vm.handle({"op": "get_output", "ref": ref["__cohost_async_ref__"]}) == "resolved"
+
+
+def test_init_worker_sets_the_member_env_only_on_the_device_thread(tmp_path, fake_vllm, monkeypatch):
+    """os.environ is process-wide: set from a socket thread, it would leak into another member's load."""
+    seen = []
+
+    class WorkerWrapperBase:
+        def __init__(self, rpc_rank):
+            pass
+
+        def init_worker(self, all_kwargs):
+            seen.append((threading.current_thread(), os.environ.get("COHOST_TEST_ENV")))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker", types.ModuleType("vllm.v1.worker"))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.worker_base",
+                        types.SimpleNamespace(WorkerWrapperBase=WorkerWrapperBase))
+    members = [{"name": "a", "kind": "vllm", "port": 21000, "model": "m/a", "env": {"COHOST_TEST_ENV": "a"}}]
+    host, vm = _member(tmp_path, {}, members=members)
+    vm._init_worker({"vllm_config": None})
+    assert seen == [(host.device._thread, "a")]
+    assert "COHOST_TEST_ENV" not in os.environ
+
+
+def test_a_member_without_warmup_still_takes_its_capture_turn(tmp_path, fake_vllm, monkeypatch):
+    """The members after it capture only once it has had its turn."""
+    for name, mod in {"vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
+                      "vllm.v1.worker.worker_base": types.SimpleNamespace(CompilationTimes=lambda **k: k),
+                      "vllm_tt_plugin": types.ModuleType("vllm_tt_plugin"),
+                      "vllm_tt_plugin.platform": types.SimpleNamespace(TTPlatform=None)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    host, vm = _member(tmp_path, {})
+    vm.wrapper = types.SimpleNamespace(worker=types.SimpleNamespace(enable_model_warmup=False, model_runner=None))
+    threading.Thread(target=lambda: (host.loaded.wait("b"), host.compiled.wait("b")), daemon=True).start()
+    vm._phased_warmup()
+    assert host._capture_turn == 1, "member b would wait for a's capture turn forever"
+
+
+@pytest.mark.parametrize("newer", [True, False])
+def test_the_phased_warmup_runs_on_older_and_newer_vllm_and_plugin_builds(tmp_path, fake_vllm, monkeypatch, newer):
+    """Older builds (tt-inference-server's 0.17.0 image): vLLM has no CompilationTimes and the runner no
+    tt_max_batch_size; their own warmup_model decodes max_num_seqs * data_parallel_size."""
+    worker_base = types.SimpleNamespace(CompilationTimes=lambda **k: k) if newer else types.ModuleType("worker_base")
+    platform = types.SimpleNamespace(check_and_update_config=lambda cfg: None, sample_on_device_mode="decode_only")
+    for name, mod in {"vllm.v1.worker": types.ModuleType("vllm.v1.worker"), "vllm.v1.worker.worker_base": worker_base,
+                      "vllm_tt_plugin": types.ModuleType("vllm_tt_plugin"),
+                      "vllm_tt_plugin.platform": types.SimpleNamespace(TTPlatform=platform)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    warmups = []
+    model = types.SimpleNamespace(
+        warmup_model_prefill=lambda enable_trace, **k: warmups.append(("prefill", enable_trace)),
+        warmup_model_decode=lambda enable_trace, **k: warmups.append(("decode", enable_trace, k["max_batch_size"])))
+    runner = types.SimpleNamespace(model=model, kv_caches=[], max_num_blocks_per_req=128, trace_mode="decode_only",
+                                   scheduler_config=types.SimpleNamespace(max_num_seqs=32),
+                                   parallel_config=types.SimpleNamespace(data_parallel_size=1))
+    if newer:
+        runner.tt_max_batch_size = 64
+    host, vm = _member(tmp_path, {})
+    vm.wrapper = types.SimpleNamespace(worker=types.SimpleNamespace(enable_model_warmup=True, model_runner=runner))
+    threading.Thread(target=lambda: (host.loaded.wait("b"), host.compiled.wait("b")), daemon=True).start()
+    result = vm._phased_warmup()
+    batch = 64 if newer else 32
+    assert warmups == [("prefill", False), ("decode", False, batch), ("decode", True, batch)]
+    assert (result is not None) == newer
+
+
+# ------------------------------------------------------------------------------ launch
+
+def test_each_vllm_member_is_a_stock_server_wired_to_the_host(tmp_path):
+    cfg = cfgmod.load(_write(tmp_path))
+    argv = launch.frontend_argv(cfg.members[1])
+    assert argv[1:4] == ["-m", "vllm.entrypoints.openai.api_server", "--model"]
+    assert argv[argv.index("--port") + 1] == "21001"
+    assert argv[argv.index("--distributed-executor-backend") + 1] == \
+        "tt_cohost.vllm_remote.RemoteExecutor"
+    env = launch.frontend_env(cfg, cfg.members[1])
+    assert env["TT_COHOST_SOCKET"] == cfg.socket_path("b") and env["TT_COHOST_MEMBER"] == "b"
+
+
+def test_a_frontend_can_import_the_package_it_was_launched_from(tmp_path):
+    """The executor qualname must resolve in the frontend, also from a checkout that is not installed."""
+    from pathlib import Path
+
+    cfg = cfgmod.load(_write(tmp_path))
+    first = launch.frontend_env(cfg, cfg.members[0])["PYTHONPATH"].split(os.pathsep)[0]
+    assert (Path(first) / "tt_cohost" / "vllm_remote.py").is_file()
+
+
+def test_the_shared_mesh_is_opened_once_with_the_real_opener(tmp_path, monkeypatch):
+    """The plugin's opener is patched to hand out the shared mesh; the host must still call
+    the original underneath, or every TTWorker recurses into itself."""
+    opened = []
+    mesh = types.SimpleNamespace(get_num_devices=lambda: 4)
+    ttw = types.SimpleNamespace(open_mesh_device=lambda cfg, mode, *rest, **kw: opened.append(mode) or mesh,
+                                close_mesh_device=lambda *a: None,
+                                get_num_available_blocks_tt=lambda cfg, n=1: 1000)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    host = hostmod.Host(cfgmod.load(_write(tmp_path)))
+    host.install_mesh_hooks()
+    assert ttw.open_mesh_device({}, "all", 0) is mesh
+    assert ttw.open_mesh_device({}, "all", 0) is mesh
+    assert opened == ["all"]
+
+
+def test_a_member_kv_cap_limits_only_that_members_pool(tmp_path, monkeypatch):
+    ttw = types.SimpleNamespace(open_mesh_device=None, close_mesh_device=None,
+                                get_num_available_blocks_tt=lambda cfg, n=1: 1000)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    members = [{"name": "a", "kind": "vllm", "port": 1, "kv_tokens": 6400},
+               {"name": "b", "kind": "vllm", "port": 2}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    host.install_mesh_hooks()
+    vcfg = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=64))
+    assert host.device.run("a", lambda: ttw.get_num_available_blocks_tt(vcfg, 4)) == 100
+    assert host.device.run("b", lambda: ttw.get_num_available_blocks_tt(vcfg, 4)) == 1000
+
+
+# ---------------------------------------------------------------------------- app members
+
+def test_app_members_boot_load_all_warm_all_release_all_warm_all_then_serve(tmp_path, monkeypatch):
+    """The second warm round compiles and allocates nothing new, so no member's long-lived buffer
+    can sit in another member's trace scratch."""
+    from tt_cohost import apps
+
+    events = []
+
+    class Fake(apps.AppMember):
+        def __init__(self, host, member):
+            self.n = member.name
+
+        def load(self, mesh):
+            events.append(("load", self.n))
+
+        def warmup(self):
+            events.append(("warmup", self.n))
+
+        def release_traces(self):
+            events.append(("release", self.n))
+
+        def asgi_app(self):
+            return self.n
+
+    members = [{"name": n, "kind": "app", "port": p, "app": "x:y"} for n, p in (("stt", 1), ("tts", 2))]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    monkeypatch.setattr(host, "open_mesh_direct", lambda: "MESH")
+    monkeypatch.setattr(apps, "load_factory", lambda spec: Fake)
+    served = []
+    monkeypatch.setattr(apps, "serve_asgi", lambda app, port, name: served.append((app, port)))
+    apps.boot_apps(host, host.cfg.members)
+    assert events == [("load", "stt"), ("load", "tts"), ("warmup", "stt"), ("warmup", "tts"),
+                      ("release", "stt"), ("release", "tts"), ("warmup", "stt"), ("warmup", "tts")]
+    assert served == [("stt", 1), ("tts", 2)]
+
+
+def test_an_app_member_whose_server_thread_ends_takes_the_group_down(tmp_path, monkeypatch):
+    """Like an exited vLLM frontend: a uvicorn thread that ends (port taken, a crash after boot)
+    would otherwise leave the group never ready, or reporting a dead port as ready."""
+    from tt_cohost import apps
+
+    class FakeHost:
+        def __init__(self, cfg):
+            self.cfg, self.ready = cfg, set()
+
+        def close(self):
+            pass
+
+    ended = threading.Thread(target=lambda: None)
+    ended.start()
+    ended.join()
+    monkeypatch.setattr(apps, "boot_apps", lambda host, members: {"tts": ended})
+    cfg = cfgmod.load(_write(tmp_path, members=[{"name": "tts", "kind": "app", "port": 1, "app": "x:y"}]))
+    stopping, rc = threading.Event(), []
+    t = threading.Thread(target=lambda: rc.append(launch._supervise(cfg, FakeHost(cfg), stopping)), daemon=True)
+    t.start()
+    t.join(10)
+    stopping.set()   # a supervisor that missed it returns now, so the test fails instead of hanging
+    t.join(10)
+    assert rc == [1]
+
+
+def test_a_late_compile_is_counted_for_the_member_that_compiled_it_on_the_device_thread(tmp_path, fake_vllm):
+    host, vm = _member(tmp_path, {"execute_model": None, "sample_tokens": "out"})
+    seen = []
+
+    class Mesh:
+        entries = 10
+
+        def num_program_cache_entries(self):
+            seen.append((threading.current_thread() is host.device._thread, host.device.owner))
+            return self.entries
+
+    host.mesh, host.cache_entries_at_capture = Mesh(), 10
+    host.mesh.entries = 13                 # this step compiled three programs
+    vm.handle({"op": "run", "method": "execute_model"})
+    vm.handle({"op": "run", "method": "sample_tokens"})
+    assert host.compiles_after_capture == {"a": 3}
+    assert seen == [(True, "a")], "ttnn is only called on the device thread, inside the step"
+
+
+def test_a_late_compile_is_counted_when_execute_model_returns_the_output(tmp_path, fake_vllm):
+    """Older vLLM/plugin builds finish the step in execute_model and never call sample_tokens."""
+    host, vm = _member(tmp_path, {"execute_model": "out"})
+    seen = []
+
+    class Mesh:
+        entries = 10
+
+        def num_program_cache_entries(self):
+            seen.append((threading.current_thread() is host.device._thread, host.device.owner))
+            return self.entries
+
+    host.mesh, host.cache_entries_at_capture = Mesh(), 10
+    host.mesh.entries = 12
+    assert vm.handle({"op": "run", "method": "execute_model"}) == "out"
+    assert host.compiles_after_capture == {"a": 2}
+    assert seen == [(True, "a")]
+    assert host.device.owner is None
+
+
+def test_an_app_request_step_counts_its_late_compiles_on_the_device_thread(tmp_path):
+    members = [{"name": "tts", "kind": "app", "port": 1, "app": "x:y"}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    seen = []
+
+    class Mesh:
+        entries = 5
+
+        def num_program_cache_entries(self):
+            seen.append(threading.current_thread() is host.device._thread)
+            return self.entries
+
+    host.mesh = Mesh()
+    host.device.run("host", host.after_all_captured)
+
+    def request():
+        host.mesh.entries = 7          # this request compiled two programs
+        return "audio"
+    assert host.step("tts", request) == "audio"
+    assert host.compiles_after_capture == {"tts": 2}
+    assert seen == [True, True]
+
+
+# ---------------------------------------------------------------------------- mixed groups
+
+def test_a_mixed_group_lists_vllm_members_before_app_members(tmp_path):
+    ok = [{"name": "llm", "kind": "vllm", "port": 1, "model": "m"},
+          {"name": "emb", "kind": "app", "port": 2, "app": "x:y"}]
+    cfg = cfgmod.load(_write(tmp_path, members=ok))
+    assert cfg.mixed
+    with pytest.raises(ValueError, match="before its app members"):
+        cfgmod.load(_write(tmp_path, members=ok[::-1]))
+
+
+def test_mixed_group_apps_load_before_vllm_weights_and_capture_after_vllm(tmp_path, monkeypatch):
+    """App weights are in DRAM before the vLLM member sizes its KV pool; both pass the same barriers; the
+    vLLM member captures first, then the apps (config order), then the cache baseline is taken."""
+    from tt_cohost import apps
+
+    events = []
+    lock = threading.Lock()
+
+    def ev(*e):
+        with lock:
+            events.append(e)
+
+    class Fake(apps.AppMember):
+        def __init__(self, host, member):
+            self.n = member.name
+
+        def load(self, mesh):
+            assert mesh == "MESH"
+            time.sleep(0.05)          # a slow load: the vLLM member must still wait for it
+            ev("load", self.n)
+
+        def warmup(self):
+            ev("warmup", self.n)
+
+        def release_traces(self):
+            ev("release", self.n)
+
+        def asgi_app(self):
+            return self.n
+
+    members = [{"name": "llm", "kind": "vllm", "port": 1, "model": "m"},
+               {"name": "emb", "kind": "app", "port": 2, "app": "x:y"},
+               {"name": "rr", "kind": "app", "port": 3, "app": "x:y"}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    host.mesh = "MESH"
+    host.mesh_ready.set()
+    monkeypatch.setattr(host, "dram_gb_per_chip", lambda: None)
+    monkeypatch.setattr(host, "after_all_captured", lambda: ev("baseline"))
+    monkeypatch.setattr(apps, "load_factory", lambda spec: Fake)
+    monkeypatch.setattr(apps, "serve_asgi", lambda app, port, name: (app, port))
+    assert not host.apps_loaded.is_set()
+
+    def vllm_member():   # what VllmMember does: load_model (gated), phased warmup
+        assert host.apps_loaded.wait(5)
+        ev("load", "llm")
+        host.loaded.wait("llm")
+        ev("warmup", "llm")
+        host.compiled.wait("llm")
+        with host.capture_turn("llm"):
+            ev("capture", "llm")
+    t = threading.Thread(target=vllm_member)
+    t.start()
+    served = apps.boot_apps(host, [m for m in host.cfg.members if m.kind == "app"])
+    t.join(5)
+    order = [e for e in events]
+    assert order.index(("load", "emb")) < order.index(("load", "llm"))
+    assert order.index(("load", "rr")) < order.index(("load", "llm"))
+    first_app_warm = order.index(("warmup", "emb"))
+    assert order.index(("load", "llm")) < first_app_warm               # loaded barrier
+    cap = order.index(("capture", "llm"))
+    assert all(order.index(("release", n)) < cap for n in ("emb", "rr"))   # compiled barrier
+    assert [e for e in order[cap:] if e[0] != "release"] == [("capture", "llm"), ("warmup", "emb"),
+                                                             ("warmup", "rr"), ("baseline",)]
+    assert served == {"emb": ("emb", 2), "rr": ("rr", 3)}
+
+
+def test_a_failed_app_load_releases_the_vllm_member_with_the_failure(tmp_path, monkeypatch):
+    from tt_cohost import apps
+
+    class Broken(apps.AppMember):
+        def __init__(self, host, member):
+            pass
+
+        def load(self, mesh):
+            raise RuntimeError("out of DRAM")
+
+    members = [{"name": "llm", "kind": "vllm", "port": 1, "model": "m"},
+               {"name": "emb", "kind": "app", "port": 2, "app": "x:y"}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    host.mesh = "MESH"
+    host.mesh_ready.set()
+    monkeypatch.setattr(host, "dram_gb_per_chip", lambda: None)
+    monkeypatch.setattr(apps, "load_factory", lambda spec: Broken)
+    with pytest.raises(RuntimeError, match="out of DRAM"):
+        apps.boot_apps(host, [host.cfg.members[1]])
+    assert host.apps_loaded.is_set()
+    with pytest.raises(RuntimeError, match="out of DRAM"):
+        host.loaded.wait("llm")
+
+
+def test_a_vllm_workers_mesh_open_passes_its_own_arguments(tmp_path, monkeypatch):
+    """The plugin's worker opens the mesh with its trace mode and the model's fabric config; the group keeps them."""
+    seen = []
+    mesh = types.SimpleNamespace(get_num_devices=lambda: 4)
+    ttw = types.SimpleNamespace(open_mesh_device=lambda *a, **k: seen.append((a, k)) or mesh,
+                                close_mesh_device=None, get_num_available_blocks_tt=lambda cfg, n=1: 1)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    host = hostmod.Host(cfgmod.load(_write(tmp_path)))
+    host.install_mesh_hooks()
+    assert ttw.open_mesh_device({"fabric_config": "FABRIC_1D"}, "all", 0, model_fabric_config="X") is mesh
+    assert ttw.open_mesh_device("ignored", "second") is mesh            # first caller wins
+    assert seen == [(({"fabric_config": "FABRIC_1D"}, "all", 0), {"model_fabric_config": "X"})]
+    assert host.mesh_ready.is_set()
+
+
+def test_the_groups_tt_config_wins_over_the_worker_that_happens_to_open_the_mesh(tmp_path, monkeypatch):
+    """The first member to reach init_device opens the mesh. Without the group's settings on top, a member with
+    no trace_region_size of its own leaves every member the plugin's 50 MB default trace region."""
+    seen = []
+    mesh = types.SimpleNamespace(get_num_devices=lambda: 4)
+    ttw = types.SimpleNamespace(open_mesh_device=lambda *a, **k: seen.append((a, k)) or mesh,
+                                close_mesh_device=None, get_num_available_blocks_tt=lambda cfg, n=1: 1)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    group = {"fabric_config": "FABRIC_1D_RING", "trace_region_size": 950000000}
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, tt_config=group)))
+    host.install_mesh_hooks()
+    ttw.open_mesh_device({"trace_mode": "decode_only", "fabric_config": "FABRIC_1D"}, "decode_only", 0,
+                         model_fabric_config="X")
+    assert seen == [(({"trace_mode": "decode_only", "fabric_config": "FABRIC_1D_RING",
+                       "trace_region_size": 950000000}, "decode_only", 0), {"model_fabric_config": "X"})]
+
+
+def test_a_non_tracing_opener_still_gets_the_groups_trace_region(tmp_path, monkeypatch):
+    seen = []
+    ttw = types.SimpleNamespace(open_mesh_device=lambda *a, **k: seen.append((a, k)) or
+                                types.SimpleNamespace(get_num_devices=lambda: 1),
+                                close_mesh_device=None, get_num_available_blocks_tt=lambda cfg, n=1: 1)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, tt_config={"trace_region_size": 1000})))
+    host.install_mesh_hooks()
+    ttw.open_mesh_device(tt_config=None, trace_mode="none")
+    assert seen == [((), {"tt_config": {"trace_region_size": 1000}, "trace_mode": "all"})]
+
+
+@pytest.mark.parametrize("has_hook", [True, False])
+def test_the_remote_executor_starts_on_vllm_builds_with_and_without_the_block_size_hook(monkeypatch, has_hook):
+    """Older TT platforms have no update_block_size_for_backend; vLLM's platform proxy returns None for it."""
+    updated = []
+    platform = types.SimpleNamespace()
+    if has_hook:
+        platform.update_block_size_for_backend = lambda cfg: updated.append(cfg)
+    else:
+        platform.update_block_size_for_backend = None
+    calls = []
+
+    class Client:
+        def __init__(self, path, timeout_s=600.0):
+            pass
+
+        def call(self, op, **kw):
+            calls.append(kw.get("method", op))
+
+    class UniProcExecutor:
+        pass
+    for name, mod in {"cloudpickle": types.ModuleType("cloudpickle"),
+                      "vllm": types.ModuleType("vllm"),
+                      "vllm.platforms": types.SimpleNamespace(current_platform=platform),
+                      "vllm.v1": types.ModuleType("vllm.v1"), "vllm.v1.executor": types.ModuleType("vllm.v1.executor"),
+                      "vllm.v1.executor.uniproc_executor": types.SimpleNamespace(UniProcExecutor=UniProcExecutor)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "tt_cohost.vllm_remote", raising=False)
+    from tt_cohost import vllm_remote
+    monkeypatch.setattr(vllm_remote.rpc, "Client", Client)
+    monkeypatch.setenv("TT_COHOST_SOCKET", "/nowhere")
+    ex = vllm_remote.RemoteExecutor.__new__(vllm_remote.RemoteExecutor)
+    ex.vllm_config = "cfg"
+    ex._distributed_args = lambda: ("tcp://x", 0, 0)
+    ex._init_executor()
+    assert calls == ["init_worker", "init_device", "load_model"]
+    assert updated == (["cfg"] if has_hook else [])
+    sys.modules.pop("tt_cohost.vllm_remote", None)
+
+
+def test_the_kv_cap_works_with_a_plugin_whose_block_count_takes_only_the_config(tmp_path, monkeypatch):
+    """Older plugins define get_num_available_blocks_tt(vllm_config), newer ones add num_devices."""
+    ttw = types.SimpleNamespace(open_mesh_device=None, close_mesh_device=None,
+                                get_num_available_blocks_tt=lambda vllm_config: 1000)
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin", types.SimpleNamespace(worker=ttw))
+    monkeypatch.setitem(sys.modules, "vllm_tt_plugin.worker", ttw)
+    members = [{"name": "a", "kind": "vllm", "port": 1, "kv_tokens": 6400}, {"name": "b", "kind": "vllm", "port": 2}]
+    host = hostmod.Host(cfgmod.load(_write(tmp_path, members=members)))
+    host.install_mesh_hooks()
+    vcfg = types.SimpleNamespace(cache_config=types.SimpleNamespace(block_size=64))
+    assert host.device.run("a", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 100
+    assert host.device.run("b", lambda: ttw.get_num_available_blocks_tt(vcfg)) == 1000
+
+
+@pytest.mark.parametrize("worker_blocks", [512, None])
+def test_the_engine_sees_the_kv_block_count_an_older_plugin_sets_on_its_worker(monkeypatch, worker_blocks):
+    """Older TT plugins return a dummy byte count from determine_available_memory and set the real KV block count on
+    the worker's cache_config; the engine in the member's process must get it, as it would with the worker in-process."""
+    worker = types.SimpleNamespace(cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+
+    class Client:
+        def call(self, op, method=None, args=(), kwargs=None):
+            if method == "determine_available_memory":
+                worker.cache_config.num_gpu_blocks_override = worker_blocks
+                return 1 << 64
+            return method(types.SimpleNamespace(worker=worker))  # a callable runs on the host's worker wrapper
+
+    class UniProcExecutor:
+        def determine_available_memory(self):
+            return self.collective_rpc("determine_available_memory")
+    for name, mod in {"cloudpickle": types.SimpleNamespace(dumps=lambda fn: fn),
+                      "vllm": types.ModuleType("vllm"),
+                      "vllm.platforms": types.SimpleNamespace(current_platform=types.SimpleNamespace()),
+                      "vllm.v1": types.ModuleType("vllm.v1"), "vllm.v1.executor": types.ModuleType("vllm.v1.executor"),
+                      "vllm.v1.executor.uniproc_executor": types.SimpleNamespace(UniProcExecutor=UniProcExecutor)}.items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.delitem(sys.modules, "tt_cohost.vllm_remote", raising=False)
+    vllm_remote = importlib.import_module("tt_cohost.vllm_remote")  # not the package attribute an earlier test left
+    ex = vllm_remote.RemoteExecutor.__new__(vllm_remote.RemoteExecutor)
+    ex._client = Client()
+    ex.vllm_config = types.SimpleNamespace(cache_config=types.SimpleNamespace(num_gpu_blocks_override=None))
+    assert ex.determine_available_memory() == [1 << 64]
+    assert ex.vllm_config.cache_config.num_gpu_blocks_override == worker_blocks
+    sys.modules.pop("tt_cohost.vllm_remote", None)
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="no SIGUSR1")
+def test_sigusr1_dumps_every_threads_stack(capfd):
+    """To tell a device hang from a host deadlock without a debugger in the image."""
+    import faulthandler
+
+    launch.dump_stacks_on_sigusr1()
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.1)
+        err = capfd.readouterr().err
+    finally:
+        faulthandler.unregister(signal.SIGUSR1)
+    assert "most recent call first" in err and "test_sigusr1_dumps_every_threads_stack" in err

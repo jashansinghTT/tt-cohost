@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tt-cohost"
+version = "0.1.0"
+description = "Serve several models from one process on the same Tenstorrent chips"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+# No hard dependencies: the runtime imports only the standard library at module level and runs in an
+# environment that already holds ttnn, vLLM and the TT plugin. Declaring any of them here would let a
+# resolver replace those builds.
+dependencies = []
+
+[project.optional-dependencies]
+# vLLM itself is intentionally absent, as in vllm-tt-plugin: it must be the locally built TT target,
+# not the (CUDA) vllm on PyPI, and a resolvable requirement could silently swap the TT build out.
+# Install tt-metal, the TT vLLM build and vllm-tt-plugin first. These are the two modules tt_cohost
+# itself imports from that environment (vLLM already brings both).
+vllm = ["cloudpickle", "uvicorn"]
+test = ["pytest>=8"]
+
+[project.scripts]
+tt-cohost = "tt_cohost.launch:main"
+
+[project.urls]
+Source = "https://github.com/jashansinghTT/tt-cohost"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tt_cohost*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
